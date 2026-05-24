@@ -123,6 +123,53 @@ is delivered, propagating cleanly to the child).
 
 ---
 
+## Deploy on Fly (UDP media)
+
+The default production target is **self-hosted LiveKit on Fly.io**. Fly is used
+because the SFU carries WebRTC audio/video over **raw UDP**, which Fly supports
+and Koyeb does not (UDP is exactly what broke the media plane on Koyeb). A
+[`fly.toml`](fly.toml) is included as the shared per-region template.
+
+```bash
+# One Fly app per region (vulos-meet-<region>); georoute steers tenants.
+fly launch --no-deploy --name vulos-meet-iad --region iad --copy-config
+
+# Dedicated IPv4 is REQUIRED to serve UDP media — Fly can't serve UDP from a
+# shared IP. Allocate v4 (and v6 for parity).
+fly ips allocate-v4 -a vulos-meet-iad
+fly ips allocate-v6 -a vulos-meet-iad
+
+# Secrets (never bake into fly.toml): livekit api_key/secret (MUST match
+# vulos-cloud MEET-CP-01), admin token, recording-cloud token, redis password.
+fly secrets set -a vulos-meet-iad MEET_ADMIN_TOKEN=... MEET_RECORDING_CLOUD_TOKEN=...
+
+fly deploy -a vulos-meet-iad --config fly.toml
+```
+
+Fly UDP essentials (see the comment block in `fly.toml` for the full detail):
+
+- **Dedicated IPv4** is mandatory for the UDP media port(s).
+- LiveKit's generated config sets `rtc.use_external_ip: true` (see
+  `internal/wrap/supervise.go`) so it advertises the machine's public IP in ICE
+  candidates — required for clients to reach a Fly-hosted SFU.
+- Fly only forwards UDP to a listener bound to `fly-global-services`.
+- **Port range:** LiveKit defaults to a 50000–60000 UDP range. Enumerating 10k
+  UDP ports on Fly is impractical, so the `fly.toml` narrows it (default
+  50000–50200) — and the LiveKit `rtc.port_range_*` in your `config.yaml` MUST
+  match. Alternatively use a single `rtc.udp_port` UDP-mux port. Confirm Fly's
+  current per-app UDP port-range limits before production.
+- The deploy image must contain BOTH the `vulos-meet` binary AND a pinned
+  `livekit-server` binary on `PATH` (or `VULOS_MEET_LIVEKIT_BIN`); add a
+  `Dockerfile` that installs both — see [`CONTRIBUTING-FORK.md`](CONTRIBUTING-FORK.md) §1.
+
+**Managed alternative.** Self-hosting on Fly is the default, but
+[LiveKit Cloud](https://livekit.io/cloud) remains a possible managed option
+later: point vulos-cloud's `MEET_*` env at the managed endpoints and skip this
+deploy. The Vulos wrap layer (token gate, tenant namespace, admin) would still
+front it. LiveKit stays Go/MIT-compatible either way.
+
+---
+
 ## Default tuning (production-relevant)
 
 - **Codec:** VP9 SVC simulcast, **3 spatial layers (180p / 360p / 720p).**

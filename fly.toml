@@ -1,0 +1,159 @@
+# fly.toml — Vulos Meet (LiveKit SFU + Vulos wrap) on Fly.io
+#
+# vulos-meet is the video-meetings server: a small Go wrapper (cmd/vulos-meet)
+# that SUPERVISES an upstream `livekit-server` child process and fronts it with
+# a VULOS-MEET/1 signal-gate. It is deployed on Fly because the LiveKit SFU
+# needs raw **UDP** for WebRTC media — Fly supports UDP, Koyeb does not (UDP is
+# exactly what broke the SFU + relay on Koyeb; see vulos-cloud Wave R).
+#
+# This file mirrors the relay's backend/relay/fly.toml structure.
+#
+#   fly launch --no-deploy --name vulos-meet-<region> --region <region> --copy-config
+#   fly ips allocate-v4 -a vulos-meet-<region>      # REQUIRED for UDP media (see below)
+#   fly secrets set ...                             # see CONTRIBUTING-FORK.md / README.md
+#
+# Per-region deployments use one Fly app per region (vulos-meet-<region>);
+# vulos-cloud's internal/georoute steers tenants to the nearest box via the
+# region tag advertised on /admin/health.
+
+app            = "vulos-meet"
+primary_region = "PLACEHOLDER"   # set to the Fly region code for this box
+                                  # (e.g. "iad", "lhr", "fra")
+
+[build]
+  # vulos-meet itself is a tiny Go binary; the actual SFU is the supervised
+  # `livekit-server` child. A deploy image must therefore contain BOTH the
+  # vulos-meet binary AND a livekit-server binary on PATH (or VULOS_MEET_
+  # LIVEKIT_BIN pointing at it). The Dockerfile (to be added) installs the
+  # pinned livekit-server release alongside vulos-meet — see CONTRIBUTING-FORK.md
+  # §1 "Binary-bump workflow" for the pinned version.
+  dockerfile = "Dockerfile"
+
+# ── Config / secrets ──────────────────────────────────────────────────────────
+# vulos-meet runs as `vulos-meet --config /etc/vulos-meet/config.yaml`. The
+# config holds livekit.api_key / api_secret (MUST match vulos-cloud MEET-CP-01),
+# region, admin.token, and the listen addrs below. Secrets are injected via
+# `fly secrets set` and templated into the config (or set as env that the
+# config references):
+#   MEET_ADMIN_TOKEN              — guards /admin/* (env wins over config)
+#   MEET_RECORDING_CLOUD_TOKEN    — bearer for egress→cloud forwarding
+#   MEET_CLUSTER_REDIS_PASSWORD   — cascading-SFU Redis password (if enabled)
+# The livekit api_key/api_secret pair is also a secret — never bake it here.
+[env]
+  # Region this box advertises on /admin/health for vulos-cloud georoute.
+  # Keep in sync with primary_region above.
+  MEET_REGION = "PLACEHOLDER"
+
+# ── Signal-gate (public HTTP/WS entry) ────────────────────────────────────────
+# The signal-gate is the ONLY public surface. Clients connect to
+# wss://meet.vulos.org/rtc and the cloud points MEET_EGRESS_BASE_URL at
+# https://meet.vulos.org/twirp/livekit.Egress (see CONTRIBUTING-FORK.md §5 —
+# vulos-meet is the sole LiveKit-talking surface; nothing bypasses it).
+#
+# NOTE: SignalGateAddr defaults to 127.0.0.1:7883 (loopback). For Fly the config
+# MUST set signal.addr to "0.0.0.0:7883" (or ":7883") so the Fly edge can reach
+# it. internal_port below must match that port.
+#
+# Admin (:7881) and metrics (127.0.0.1:7882) are intentionally NOT exposed as
+# Fly services — they stay internal (admin reachable via `fly ssh`/private net,
+# metrics scraped over the Fly 6PN private network).
+[http_service]
+  internal_port        = 7883            # signal.addr in config.yaml
+  force_https          = true
+  auto_stop_machines   = "off"           # SFU media sessions are long-lived; do
+  auto_start_machines  = true            #   not suspend a box mid-call
+  min_machines_running = 1               # always keep one box live per region
+  processes            = ["app"]
+
+  [http_service.concurrency]
+    type       = "connections"
+    hard_limit = 1000   # signaling connections (media rides UDP, not this port)
+    soft_limit = 800
+
+  [[http_service.checks]]
+    type         = "http"
+    port         = 7881          # admin /admin/health (liveness; advertises region)
+    path         = "/admin/health"
+    interval     = "15s"
+    timeout      = "5s"
+    grace_period = "20s"         # livekit-server child needs a moment to come up
+
+# ── WebRTC media (raw UDP) ────────────────────────────────────────────────────
+# LiveKit's SFU carries audio/video over a UDP port range (rtc.port_range_start
+# .. port_range_end in the generated LiveKit config; vulos-meet defaults are
+# 50000-60000 — see internal/wrap/config.go). THIS is the port range that needs
+# UDP on Fly and was impossible on Koyeb.
+#
+# ── FLY UDP REQUIREMENTS (read before first deploy) ───────────────────────────
+#   1. DEDICATED IPv4 — UDP cannot be served from a shared IP:
+#        fly ips allocate-v4 -a vulos-meet-<region>
+#        fly ips allocate-v6 -a vulos-meet-<region>   # v6 for parity
+#   2. LiveKit must bind/advertise the right external address. The generated
+#      LiveKit config already sets `rtc.use_external_ip: true` (see
+#      internal/wrap/supervise.go writeLiveKitConfig), so LiveKit discovers and
+#      advertises the machine's public IP in ICE candidates — which is what a
+#      client needs to send media to a Fly-hosted SFU. Keep use_external_ip on.
+#   3. Fly only forwards UDP to a listener bound to `fly-global-services`. For
+#      LiveKit that means setting `rtc.udp_port`/the media bind to the
+#      fly-global-services interface; on a single-port setup LiveKit can also use
+#      a single `rtc.udp_port` instead of the range. See "port-range caveat".
+#
+# ── PORT-RANGE CAVEAT (honest unknown) ────────────────────────────────────────
+# Fly UDP services declare an explicit port (or start_port/end_port range). A
+# full 50000-60000 (10k ports) UDP range is impractical to enumerate and is
+# heavier than a single-region SFU needs. Two supported shapes:
+#
+#   (a) NARROW RANGE (recommended): shrink LiveKit's rtc.port_range_* to a small
+#       window (e.g. 50000-50200) in config.yaml AND mirror it here. Each Fly
+#       machine handles ~its share of concurrent media streams; scale out with
+#       more machines/regions rather than a wider range.
+#   (b) SINGLE UDP MUX PORT: set LiveKit `rtc.udp_port` to one port (e.g. 7882…
+#       pick a free one, NOT the metrics port) and `rtc.port_range_*` unset, so
+#       all media muxes over one UDP port. Simplest on Fly; expose just that one
+#       UDP port below.
+#
+# The block below uses shape (a) with a NARROW 50000-50200 range. **Confirm the
+# exact range against Fly's current UDP port-range support and your concurrency
+# target before production** — Fly's per-app UDP port-range limits are the main
+# unknown here. Whatever you choose, config.yaml's rtc.port_range_* MUST match.
+[[services]]
+  protocol      = "udp"
+  internal_port = 50000        # media range start inside the container
+  processes     = ["app"]
+
+  [[services.ports]]
+    start_port = 50000         # MUST match LiveKit rtc.port_range_start in config.yaml
+    end_port   = 50200         # MUST match LiveKit rtc.port_range_end   in config.yaml
+    handlers   = []            # raw UDP — no TLS/HTTP handler; WebRTC media
+
+# ── TURN/UDP (optional fallback) ──────────────────────────────────────────────
+# If LiveKit's embedded TURN is enabled (config.yaml livekit.turn_addr -> the
+# generated `turn.udp_port`, see writeLiveKitConfig), expose its UDP port here.
+# Same Fly UDP rules apply (dedicated v4 + fly-global-services bind). Commented
+# out by default — enable only if you turn on LiveKit TURN.
+# [[services]]
+#   protocol      = "udp"
+#   internal_port = 3478
+#   processes     = ["app"]
+#   [[services.ports]]
+#     port     = 3478
+#     handlers = []
+
+# ── VM sizing ─────────────────────────────────────────────────────────────────
+# An SFU is CPU- and bandwidth-bound (it forwards every stream). Start on a
+# performance VM with real memory; a shared-cpu box will struggle past a handful
+# of concurrent video publishers. Upgrade size as concurrency grows.
+[[vm]]
+  size   = "performance-2x"
+  memory = "4gb"
+
+# ── No mounts ─────────────────────────────────────────────────────────────────
+# The SFU is stateless (recording/egress is pushed to vulos-cloud, not stored
+# here). Cascading-SFU node discovery uses Redis, configured separately.
+
+# ── Managed alternative ───────────────────────────────────────────────────────
+# Self-hosting livekit-server on Fly (this file) is the DEFAULT. LiveKit Cloud
+# remains a possible managed option later (point vulos-cloud's MEET_* env at the
+# managed endpoints + skip this deploy); revisit if self-host ops become a
+# burden. The Vulos wrap layer (token gate, tenant namespace, admin) would still
+# front it.
