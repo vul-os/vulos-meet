@@ -36,6 +36,15 @@ The wrapper adds the pieces LiveKit alone does not give us:
 - **Admin HTTP surface.** Tiny: `/admin/health`,
   `/admin/tenants/{tenant}/rooms`, `/admin/tenants/{tenant}/rooms/{room}`.
   Guarded by `MEET_ADMIN_TOKEN` (env), constant-time compared.
+- **Sole LiveKit-talking surface.** vulos-meet is the only Vulos process
+  that talks to the supervised `livekit-server` child. The signal-gate
+  proxies BOTH `/rtc` (WebSocket signaling) AND
+  `/twirp/livekit.Egress/*` (egress RPCs from
+  `vulos-cloud`'s `meetalloc/recording.go`) through the tenant gate. The
+  cloud's `MEET_EGRESS_BASE_URL` MUST target vulos-meet's signal-gate
+  listener, not LiveKit-Server directly — bypassing vulos-meet would
+  silently drop the VULOS-MEET/1 tenant-binding check and the metric
+  counters. See [`CONTRIBUTING-FORK.md`](CONTRIBUTING-FORK.md) §5.
 
 It is also **self-hostable as a standalone SFU.** Bring your own
 LiveKit-compatible token-minter and you have a Vulos-flavoured Meet

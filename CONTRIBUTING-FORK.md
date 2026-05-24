@@ -171,7 +171,49 @@ CI variants we run on bump PRs (binary OR protocol):
 
 ---
 
-## 5. What this file is NOT
+## 5. vulos-meet is the sole LiveKit-talking surface
+
+**Invariant (FROZEN):** `vulos-meet` is the only Vulos process that talks
+directly to the supervised `livekit-server` child. The cloud control plane
+(`vulos-cloud`) MUST NOT bypass it.
+
+Concretely, that means cloud-side env vars target the vulos-meet signal-gate
+listener (`SignalGateAddr`), NOT `livekit-server` directly:
+
+- `MEET_EGRESS_BASE_URL` — cloud's `internal/meetalloc/recording.go`
+  HTTPEgressClient sends `POST {base}/twirp/livekit.Egress/<Method>` here.
+  MUST resolve to `vulos-meet`'s signal-gate (e.g. `https://meet.vulos.org`),
+  NOT `livekit-server:7880`.
+- Meeting-join WebSocket URLs handed to clients also target vulos-meet
+  (`wss://meet.vulos.org/rtc`), again NOT LiveKit directly.
+
+vulos-meet's signal-gate proxies two paths through the tenant gate:
+
+| Path                                | What it does                                  | Token grant required |
+|-------------------------------------|-----------------------------------------------|----------------------|
+| `/rtc` (WebSocket upgrade)          | `Validator.Validate` → forward to LiveKit /rtc | `RoomJoin: true`     |
+| `/twirp/livekit.Egress/*` (POST)    | `Validator.Validate` + `RoomRecord: true` invariant → forward verbatim to LiveKit Twirp | `RoomRecord: true`   |
+
+Other Twirp namespaces (e.g. `/twirp/livekit.RoomService/*`) are NOT proxied
+today — the cloud uses its own gRPC RoomService client for those calls, and
+vulos-meet's own admin surface (`/admin/tenants/{tenant}/rooms/*`) is the
+documented external seam. If a future task moves RoomService through
+vulos-meet too, extend `internal/wrap/egress_proxy.go` with a sibling
+auth-checked handler (the egress proxy is the template).
+
+**Why this matters.** If the cloud points `MEET_EGRESS_BASE_URL` directly
+at `livekit-server`, the tenant gate, the metric counters, and the
+lifecycle hook all silently no-op for egress calls — LiveKit's own JWT
+verification still accepts the token, but the VULOS-MEET/1 tenant-binding
+rule is not enforced. That is exactly the configuration this section
+exists to prevent.
+
+The relevant proxy code is `internal/wrap/egress_proxy.go`; tests in
+`internal/wrap/egress_proxy_test.go` lock the behaviour.
+
+---
+
+## 6. What this file is NOT
 
 - It is **not** a fork-merge runbook. We don't fork `livekit-server`.
 - It is **not** a place to record vendoring policy. We don't vendor.

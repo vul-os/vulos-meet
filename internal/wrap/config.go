@@ -83,6 +83,14 @@ type LiveKitConfig struct {
 
 	// TURN listen address (e.g. ":3478"). Empty disables TURN.
 	TURNAddr string `yaml:"turn_addr"`
+
+	// EgressUpstreamAddr is the host:port of livekit-server's Twirp surface
+	// (LiveKit serves /twirp/livekit.Egress/* on the same listener as
+	// signaling). Default: SignalingAddr's host. Operators rarely touch
+	// this — it exists so a test deployment can point the egress proxy at
+	// a stub LiveKit binary without retargeting the signaling reverse
+	// proxy. See internal/wrap/egress_proxy.go.
+	EgressUpstreamAddr string `yaml:"egress_upstream_addr"`
 }
 
 // AdminConfig is the admin HTTP surface config.
@@ -241,6 +249,10 @@ func (c *Config) applyDefaults() {
 	}
 	if c.LiveKit.SignalingAddr == "" {
 		c.LiveKit.SignalingAddr = ":7880"
+	}
+	if c.LiveKit.EgressUpstreamAddr == "" {
+		// LiveKit serves Twirp on the same port as signaling.
+		c.LiveKit.EgressUpstreamAddr = c.LiveKit.SignalingAddr
 	}
 	if c.LiveKit.RTCPortRangeStart == 0 {
 		c.LiveKit.RTCPortRangeStart = 50000

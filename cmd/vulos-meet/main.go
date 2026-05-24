@@ -108,6 +108,17 @@ func run(configPath, adminAddrOverride, metricsAddrOverride string) error {
 		return err
 	}
 
+	// Egress Twirp reverse proxy: validates VULOS-MEET/1 tokens with the
+	// per-egress RoomRecord grant invariant before forwarding the body
+	// verbatim to livekit-server's /twirp/livekit.Egress/<Method> surface.
+	// vulos-meet is the sole LiveKit-talking surface — cloud's
+	// MEET_EGRESS_BASE_URL targets this listener, not LiveKit-Server
+	// directly. See CONTRIBUTING-FORK.md §6.
+	egressProxy, err := wrap.NewEgressProxy(validator, cfg.LiveKit.EgressUpstreamAddr)
+	if err != nil {
+		return err
+	}
+
 	// Egress webhook receiver: forwards LiveKit egress events to the cloud
 	// (MEET-RECORDING-01) after verifying the LiveKit signature.
 	egressRx, err := wrap.NewEgressReceiver(wrap.EgressReceiverConfig{
@@ -162,13 +173,13 @@ func run(configPath, adminAddrOverride, metricsAddrOverride string) error {
 	// Signaling gate (reverse proxy in front of /rtc).
 	signalSrv := &http.Server{
 		Addr:              cfg.SignalGateAddr(),
-		Handler:           signalGate.Handler(egressRx.Handler()),
+		Handler:           signalGate.Handler(egressRx.Handler(), egressProxy),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		log.Printf("vulos-meet: signal-gate listening on %s (-> %s)", signalSrv.Addr, cfg.LiveKit.SignalingAddr)
+		log.Printf("vulos-meet: signal-gate listening on %s (/rtc -> %s, /twirp/livekit.Egress -> %s)", signalSrv.Addr, cfg.LiveKit.SignalingAddr, cfg.LiveKit.EgressUpstreamAddr)
 		if err := signalSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- fmt.Errorf("signal-gate server: %w", err)
 		}

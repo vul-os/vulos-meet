@@ -48,7 +48,7 @@ func TestSignalGate_ValidTokenForwarded(t *testing.T) {
 	addr := strings.TrimPrefix(upstream.URL, "http://")
 	g, _ := newGateForTest(t, addr)
 
-	gate := httptest.NewServer(g.Handler(nil))
+	gate := httptest.NewServer(g.Handler(nil, nil))
 	defer gate.Close()
 
 	tok := mintToken(t, "acme", "standup", time.Hour)
@@ -76,7 +76,7 @@ func TestSignalGate_NoTokenRejected(t *testing.T) {
 	addr := strings.TrimPrefix(upstream.URL, "http://")
 	g, _ := newGateForTest(t, addr)
 
-	gate := httptest.NewServer(g.Handler(nil))
+	gate := httptest.NewServer(g.Handler(nil, nil))
 	defer gate.Close()
 
 	resp, err := http.Get(gate.URL + "/rtc")
@@ -99,7 +99,7 @@ func TestSignalGate_MalformedTokenRejected(t *testing.T) {
 	addr := strings.TrimPrefix(upstream.URL, "http://")
 	g, _ := newGateForTest(t, addr)
 
-	gate := httptest.NewServer(g.Handler(nil))
+	gate := httptest.NewServer(g.Handler(nil, nil))
 	defer gate.Close()
 
 	resp, err := http.Get(gate.URL + "/rtc?access_token=not-a-jwt")
@@ -127,7 +127,7 @@ func TestSignalGate_WrongTenantRejected_403(t *testing.T) {
 	addr := strings.TrimPrefix(upstream.URL, "http://")
 	g, _ := newGateForTest(t, addr)
 
-	gate := httptest.NewServer(g.Handler(nil))
+	gate := httptest.NewServer(g.Handler(nil, nil))
 	defer gate.Close()
 
 	// Token where room prefix says "acme" but the audience (`name`) says
@@ -164,7 +164,7 @@ func TestSignalGate_BearerHeaderAlsoAccepted(t *testing.T) {
 	addr := strings.TrimPrefix(upstream.URL, "http://")
 	g, _ := newGateForTest(t, addr)
 
-	gate := httptest.NewServer(g.Handler(nil))
+	gate := httptest.NewServer(g.Handler(nil, nil))
 	defer gate.Close()
 
 	tok := mintToken(t, "acme", "standup", time.Hour)
@@ -195,7 +195,7 @@ func TestSignalGate_NonRTCRouteSentToSibling(t *testing.T) {
 		siblingHit = true
 		w.WriteHeader(http.StatusTeapot)
 	})
-	gate := httptest.NewServer(g.Handler(sibling))
+	gate := httptest.NewServer(g.Handler(sibling, nil))
 	defer gate.Close()
 
 	resp, err := http.Get(gate.URL + "/anything")

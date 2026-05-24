@@ -68,13 +68,19 @@ func NewSignalGate(v *Validator, upstreamAddr string) (*SignalGate, error) {
 // Handler returns an http.Handler that mounts the signaling proxy AT THE
 // ROOT and accepts a sibling handler for non-signaling routes (currently:
 // the egress webhook receiver from MEET-RECORDING-DRIVER-05). The non-
-// signaling handler is reached for any path other than /rtc.
+// signaling handler is reached for any path other than /rtc and the
+// egress-Twirp prefix.
 //
 // Layout:
 //
-//	/rtc(?token=…)     → token-validated, proxied to upstream LiveKit
-//	/<anything-else>   → siblingHandler (egress webhook, /healthz, etc.)
-func (g *SignalGate) Handler(siblingHandler http.Handler) http.Handler {
+//	/rtc(?token=…)                      → token-validated, proxied to LiveKit /rtc
+//	/twirp/livekit.Egress/<Method>      → token-validated (RoomRecord), proxied to LiveKit Twirp
+//	/<anything-else>                    → siblingHandler (egress webhook, /healthz, etc.)
+//
+// The egress-Twirp branch is only mounted when egressProxy != nil. Callers
+// that do not want the egress surface (early bring-up / test scaffolding)
+// can pass nil and only /rtc + sibling are wired.
+func (g *SignalGate) Handler(siblingHandler http.Handler, egressProxy *EgressProxy) http.Handler {
 	if siblingHandler == nil {
 		siblingHandler = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			http.NotFound(w, nil)
@@ -82,6 +88,12 @@ func (g *SignalGate) Handler(siblingHandler http.Handler) http.Handler {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/rtc", g.handleRTC)
+	if egressProxy != nil {
+		// http.ServeMux pattern: trailing slash makes this a subtree match,
+		// so /twirp/livekit.Egress/StartRoomCompositeEgress, /StopEgress,
+		// /UpdateLayout, /ListEgress all dispatch into the egress proxy.
+		mux.Handle(EgressTwirpPathPrefix, egressProxy.Handler())
+	}
 	mux.Handle("/", siblingHandler)
 	return mux
 }

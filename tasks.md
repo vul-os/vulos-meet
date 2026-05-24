@@ -1,13 +1,14 @@
 # vulos-meet — Task Backlog
 
-**Status: 7 / 7 tasks done (100%).**
+**Status: 8 / 8 tasks done (100%).**
 Wave B foundation (MEET-CORE-01) is shipped: repo bootstrap, LiveKit-supervise
 wrapper, VULOS-MEET/1 token validation, per-tenant room-namespace gate, admin
 HTTP surface with `MEET_ADMIN_TOKEN` constant-time compare, georoute hook for
 vulos-cloud CLOUD-REGION-01, YAML config, and the spec docs
 (`spec/VERSIONS.md`, `spec/TOKEN.md`). Follow-ups MEET-ROOMSVC-02, MEET-SIGNAL-
 GATE-03, MEET-CASCADE-CFG-04, MEET-RECORDING-DRIVER-05, MEET-METRICS-06, and
-MEET-UPSTREAM-MERGE-07 are now shipped.
+MEET-UPSTREAM-MERGE-07 are shipped. Audit-2 fix wave: FIX-MEET-EGRESS-PROXY-01
+(Twirp egress reverse-proxy on the signal-gate).
 
 Module: `github.com/vul-os/vulos-meet` — the 5th OSS sibling repo. Wraps
 [LiveKit Server](https://github.com/livekit/livekit-server) (Apache 2.0,
@@ -92,5 +93,16 @@ AC: [x] /metrics surface exists [x] counters cover admin auth fail, tenant misma
 `done` · P3 · S · dep: MEET-CORE-01 · parallel: yes — CONTRIBUTING-FORK.md (new)
 Scope: Document the workflow for tracking upstream `github.com/livekit/livekit-server` releases. Because we supervise (not vendor) livekit-server, "tracking upstream" means bumping the pinned binary version and re-running our token-validation tests against it, NOT a Go-module merge. Capture the test matrix (one LiveKit minor we ship, one prior). Also document the `livekit/protocol` Go-module bump path (where token validation actually lives).
 AC: [x] CONTRIBUTING-FORK.md lists the binary-bump workflow [x] documents `livekit/protocol` Go-module bump [x] no kernel/wrap code edited by this task
+
+---
+
+## Area: Audit-2 fix wave
+
+_Findings from the second audit pass (2026-05). Each P0 task closes a gap where the cloud doc claims a behaviour that vulos-meet didn't actually implement; the cloud's only working escape was to bypass vulos-meet, breaking the "sole LiveKit-talking surface" invariant._
+
+### [FIX-MEET-EGRESS-PROXY-01] Twirp egress reverse-proxy on the signal-gate
+`done` · P0 · M · dep: MEET-SIGNAL-GATE-03, MEET-RECORDING-DRIVER-05 · parallel: no — internal/wrap/egress_proxy.go (new), internal/wrap/signal.go, cmd/vulos-meet/main.go, CONTRIBUTING-FORK.md, README.md
+Scope: Before this task, `SignalGate.Handler` only proxied `/rtc`; Twirp egress paths weren't handled, so the cloud's `internal/meetalloc/recording.go` had to point `MEET_EGRESS_BASE_URL` at `livekit-server` directly, bypassing the tenant gate, metrics, and lifecycle hook. Add a `/twirp/livekit.Egress/*` reverse proxy as a sibling to the `/rtc` proxy: validate the inbound JWT (VULOS-MEET/1 with `RoomRecord: true` invariant), reject cross-tenant tokens with 403 + opaque body BEFORE upstream is contacted, and forward the request body byte-for-byte (Twirp is protobuf — opaque pass-through, `io.Copy`). Config knob `livekit.egress_upstream_addr` (default = `livekit.signaling_addr` since LiveKit serves Twirp on the same port). Document in CONTRIBUTING-FORK.md §5 + README.md that vulos-meet is the sole LiveKit-talking surface and `MEET_EGRESS_BASE_URL` MUST target the signal-gate.
+AC: [x] `/twirp/livekit.Egress/*` proxy added with auth check [x] cross-tenant token returns 403 before upstream is contacted [x] missing/malformed token returns 401 [x] token without `RoomRecord` returns 403 (defense vs. meeting-join-token replay) [x] non-egress Twirp paths fall through to sibling (policy documented) [x] body forwarded verbatim (regression test asserts byte-equal) [x] `/rtc` proxy still works (regression-tested) [x] go build ./... && go vet ./... && go test ./... [x] gofmt -l . empty
 
 ---
