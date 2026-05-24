@@ -33,6 +33,7 @@ func main() {
 	var (
 		configPath  = flag.String("config", "", "path to YAML config file (required)")
 		adminAddr   = flag.String("addr", "", "admin HTTP listen address (overrides config.admin.addr)")
+		metricsAddr = flag.String("metrics-addr", "", "metrics HTTP listen address (default \"127.0.0.1:7882\")")
 		showVersion = flag.Bool("version", false, "print version and exit")
 	)
 	flag.Parse()
@@ -42,18 +43,24 @@ func main() {
 		return
 	}
 
-	if err := run(*configPath, *adminAddr); err != nil {
+	if err := run(*configPath, *adminAddr, *metricsAddr); err != nil {
 		log.Fatalf("vulos-meet: %v", err)
 	}
 }
 
-func run(configPath, adminAddrOverride string) error {
+func run(configPath, adminAddrOverride, metricsAddrOverride string) error {
 	cfg, err := wrap.LoadConfig(configPath)
 	if err != nil {
 		return err
 	}
 	if adminAddrOverride != "" {
 		cfg.Admin.Addr = adminAddrOverride
+	}
+	metricsAddr := metricsAddrOverride
+	if metricsAddr == "" {
+		// Default to loopback so /metrics is reachable by a localhost
+		// scraper or sidecar without exposing admin to the same network.
+		metricsAddr = "127.0.0.1:7882"
 	}
 
 	tenant := wrap.NewTenant(cfg.TenantSeparator)
@@ -63,20 +70,54 @@ func run(configPath, adminAddrOverride string) error {
 		return err
 	}
 
-	// In-memory room service for now. The follow-up MEET-ROOMSVC task swaps
-	// this for the real livekit/protocol RoomServiceClient (gRPC). The
-	// admin surface and tenant gate do not change.
-	rooms := wrap.NewMemoryRoomService()
+	// Metrics registry. Shared by admin (request counter + per-tenant room
+	// gauge), validator (token-outcome counter), and the signaling gate.
+	metrics := wrap.NewMetrics()
+
+	// Real LiveKit RoomService client (gRPC to the supervised child). The
+	// admin surface and tenant gate are unchanged — they speak to the
+	// RoomService interface only.
+	rooms, err := wrap.NewLiveKitRoomService(wrap.LiveKitRoomServiceConfig{
+		SignalingAddr: cfg.LiveKit.SignalingAddr,
+		APIKey:        cfg.LiveKit.APIKey,
+		APISecret:     cfg.LiveKit.APISecret,
+	})
+	if err != nil {
+		return err
+	}
 
 	admin, err := wrap.NewAdminServer(tenant, rooms, geo, cfg.Admin.Token, version)
 	if err != nil {
 		return err
 	}
+	admin.SetMetrics(metrics)
 
-	// Validator is constructed but only used by the (future) signaling
-	// gate. We construct it now so a malformed key/secret pair fails fast
-	// at startup instead of at first connection.
-	if _, err := wrap.NewValidator(cfg.LiveKit.APIKey, cfg.LiveKit.APISecret, tenant); err != nil {
+	// Validator is the admission seam used by the signaling reverse proxy.
+	// We construct it here so a malformed key/secret pair fails fast at
+	// startup instead of at first connection.
+	validator, err := wrap.NewValidator(cfg.LiveKit.APIKey, cfg.LiveKit.APISecret, tenant)
+	if err != nil {
+		return err
+	}
+	validator.SetMetrics(metrics)
+
+	// Signaling reverse proxy: validates VULOS-MEET/1 tokens before
+	// forwarding the WebSocket upgrade to livekit-server's /rtc.
+	signalGate, err := wrap.NewSignalGate(validator, cfg.LiveKit.SignalingAddr)
+	if err != nil {
+		return err
+	}
+
+	// Egress webhook receiver: forwards LiveKit egress events to the cloud
+	// (MEET-RECORDING-01) after verifying the LiveKit signature.
+	egressRx, err := wrap.NewEgressReceiver(wrap.EgressReceiverConfig{
+		Tenant:       tenant,
+		APIKey:       cfg.LiveKit.APIKey,
+		APISecret:    cfg.LiveKit.APISecret,
+		CloudURL:     cfg.Recording.EgressEndpoint,
+		CloudAuthTok: os.Getenv("MEET_RECORDING_CLOUD_TOKEN"),
+	})
+	if err != nil {
 		return err
 	}
 
@@ -84,7 +125,7 @@ func run(configPath, adminAddrOverride string) error {
 	defer stop()
 
 	var wg sync.WaitGroup
-	errCh := make(chan error, 2)
+	errCh := make(chan error, 4)
 
 	// Admin HTTP server.
 	adminSrv := &http.Server{
@@ -98,6 +139,38 @@ func run(configPath, adminAddrOverride string) error {
 		log.Printf("vulos-meet: admin listening on %s (region=%s)", cfg.Admin.Addr, cfg.Region)
 		if err := adminSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- fmt.Errorf("admin server: %w", err)
+		}
+	}()
+
+	// Metrics HTTP server (separate listener, scoped to internal network).
+	metricsMux := http.NewServeMux()
+	metricsMux.Handle("/metrics", metrics.Handler())
+	metricsSrv := &http.Server{
+		Addr:              metricsAddr,
+		Handler:           metricsMux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		log.Printf("vulos-meet: metrics listening on %s", metricsAddr)
+		if err := metricsSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errCh <- fmt.Errorf("metrics server: %w", err)
+		}
+	}()
+
+	// Signaling gate (reverse proxy in front of /rtc).
+	signalSrv := &http.Server{
+		Addr:              cfg.SignalGateAddr(),
+		Handler:           signalGate.Handler(egressRx.Handler()),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		log.Printf("vulos-meet: signal-gate listening on %s (-> %s)", signalSrv.Addr, cfg.LiveKit.SignalingAddr)
+		if err := signalSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errCh <- fmt.Errorf("signal-gate server: %w", err)
 		}
 	}()
 
@@ -124,6 +197,9 @@ func run(configPath, adminAddrOverride string) error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = adminSrv.Shutdown(shutdownCtx)
+	_ = metricsSrv.Shutdown(shutdownCtx)
+	_ = signalSrv.Shutdown(shutdownCtx)
+	rooms.Close()
 
 	wg.Wait()
 	return nil

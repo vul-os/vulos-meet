@@ -40,6 +40,13 @@ func SuperviseLiveKit(ctx context.Context, cfg *Config, lkConfigPath string) err
 	if _, err := exec.LookPath(bin); err != nil {
 		return fmt.Errorf("vulos-meet: livekit-server binary not found (set %s or install livekit-server): %w", LiveKitBinaryEnv, err)
 	}
+	// Self-check: if cascading SFU is on, verify Redis is reachable BEFORE
+	// we exec livekit-server. A reachable Redis is a prerequisite for the
+	// cluster block we just rendered; failing fast here is much friendlier
+	// than letting livekit-server crash 200ms into startup.
+	if err := PingClusterRedis(ctx, cfg); err != nil {
+		return err
+	}
 	if err := writeLiveKitConfig(cfg, lkConfigPath); err != nil {
 		return err
 	}
@@ -104,8 +111,15 @@ func writeLiveKitConfig(cfg *Config, path string) error {
 	}
 	if cfg.Recording.EgressEndpoint != "" {
 		// Egress hook: vulos-cloud MEET-RECORDING-01 sits behind this URL.
+		// We point LiveKit at OUR webhook receiver (NewEgressReceiver), not
+		// directly at the cloud — that keeps the cloud out of LiveKit's
+		// webhook-secret rotation loop. See MEET-RECORDING-DRIVER-05.
 		doc += "egress:\n" +
 			"  webhook_url: " + cfg.Recording.EgressEndpoint + "\n"
+	}
+	if block := renderClusterBlock(cfg); block != "" {
+		// Cascading-SFU cluster discovery via Redis. See MEET-CASCADE-CFG-04.
+		doc += block
 	}
 	return os.WriteFile(path, []byte(doc), 0o600)
 }

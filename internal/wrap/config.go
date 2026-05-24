@@ -42,6 +42,24 @@ type Config struct {
 	// egress driver lives there; this is just the endpoint URL we hand
 	// LiveKit Server so it knows where to push egress events.
 	Recording RecordingConfig `yaml:"recording"`
+
+	// Cluster is the cascading-SFU discovery layer. When `cascading_sfu` is
+	// enabled in Media, vulos-meet renders a Redis-discovery block into the
+	// generated LiveKit config (see MEET-CASCADE-CFG-04) and pings the
+	// Redis target before exec'ing livekit-server so a misconfigured cluster
+	// fails fast instead of half-up.
+	Cluster ClusterConfig `yaml:"cluster"`
+
+	// Signal is the front-side WebSocket reverse proxy that enforces
+	// VULOS-MEET/1 at the edge. See MEET-SIGNAL-GATE-03.
+	Signal SignalConfig `yaml:"signal"`
+
+	// cascadingExplicit tracks whether the YAML explicitly set
+	// media.cascading_sfu (as opposed to leaving it for the default). Used
+	// only by Validate to distinguish "operator set it on, forgot redis"
+	// (a fail-fast error) from "we defaulted it on; tolerate the no-op
+	// render". Not serialised — internal bookkeeping.
+	cascadingExplicit bool `yaml:"-"`
 }
 
 // LiveKitConfig holds the LiveKit Server credentials and listen addrs.
@@ -101,6 +119,55 @@ type RecordingConfig struct {
 	EgressEndpoint string `yaml:"egress_endpoint"`
 }
 
+// ClusterConfig is the cascading-SFU discovery configuration. LiveKit uses
+// Redis to discover peer SFU nodes; for a single-box deployment this whole
+// block is unset and the renderer omits it. When CascadingSFU is enabled,
+// Redis is REQUIRED — the startup self-check fails fast if Redis is
+// unreachable.
+type ClusterConfig struct {
+	// Redis is the Redis target LiveKit uses for node discovery (a single
+	// instance is fine; LiveKit doesn't require cluster mode).
+	Redis ClusterRedisConfig `yaml:"redis"`
+
+	// NodeID is the unique-per-node identifier advertised to the cluster.
+	// MUST be stable across restarts (otherwise peer SFUs see a new node
+	// every time we bounce). Falls back to the box hostname when empty.
+	NodeID string `yaml:"node_id"`
+
+	// Region intentionally has no YAML tag: it is mirrored from cfg.Region
+	// during applyDefaults() so the cluster view cannot drift from the
+	// georoute view. Setting it in YAML is a user error we silently
+	// override.
+	Region string `yaml:"-"`
+}
+
+// ClusterRedisConfig is the LiveKit cluster Redis dial spec. We keep this
+// minimal — username/password/tls live behind the same address as a URI is
+// fine for v1.
+type ClusterRedisConfig struct {
+	// Addr is the Redis host:port (e.g. "redis.internal:6379"). Empty
+	// disables cluster discovery even if CascadingSFU is on.
+	Addr string `yaml:"addr"`
+
+	// DB is the optional Redis DB index. Defaults to 0.
+	DB int `yaml:"db"`
+
+	// Password is an optional Redis password. Prefer the
+	// MEET_CLUSTER_REDIS_PASSWORD env override (applied during applyEnv) so
+	// the YAML on disk never holds a secret.
+	Password string `yaml:"password"`
+}
+
+// SignalConfig is the front-side WebSocket reverse proxy listen address. The
+// gate validates VULOS-MEET/1 tokens before forwarding the WebSocket upgrade
+// to livekit-server's /rtc endpoint.
+type SignalConfig struct {
+	// Addr is the listen address the gate exposes (e.g. ":7882"). When
+	// empty, the gate is mounted on the same loopback by default in
+	// SignalGateAddr().
+	Addr string `yaml:"addr"`
+}
+
 // LoadConfig reads, parses, and validates a YAML config file. Env overrides
 // are applied after parsing so an operator can shove the admin token through
 // systemd without committing it to disk.
@@ -124,6 +191,11 @@ func ParseConfig(raw []byte) (*Config, error) {
 	if err := dec.Decode(&c); err != nil {
 		return nil, fmt.Errorf("vulos-meet: parse config: %w", err)
 	}
+	// Capture "was cascading_sfu explicitly set?" BEFORE applyDefaults, so
+	// downstream validation can distinguish "operator turned it on but
+	// forgot redis" (fail-fast) from "we defaulted it on; tolerate" (no
+	// render).
+	c.cascadingExplicit = c.Media.CascadingSFU != nil
 	c.applyEnv()
 	c.applyDefaults()
 	if err := c.Validate(); err != nil {
@@ -136,7 +208,15 @@ func (c *Config) applyEnv() {
 	if v := os.Getenv(AdminTokenEnv); v != "" {
 		c.Admin.Token = v
 	}
+	if v := os.Getenv(ClusterRedisPasswordEnv); v != "" {
+		c.Cluster.Redis.Password = v
+	}
 }
+
+// ClusterRedisPasswordEnv carries the Redis password used by the cascading-
+// SFU cluster discovery. Env-only by convention so the YAML on disk does
+// not hold the secret.
+const ClusterRedisPasswordEnv = "MEET_CLUSTER_REDIS_PASSWORD"
 
 func (c *Config) applyDefaults() {
 	if c.TenantSeparator == "" {
@@ -171,6 +251,27 @@ func (c *Config) applyDefaults() {
 	if c.Admin.Addr == "" {
 		c.Admin.Addr = ":7881"
 	}
+	// Cluster.Region is a mirror of the box region; if the operator sets it
+	// in YAML we silently overwrite to keep the cluster + georoute views
+	// consistent. There is no "this node is in region X but advertises
+	// region Y" mode — it would just be a fan-out attack on debuggability.
+	c.Cluster.Region = c.Region
+}
+
+// SignalGateAddr returns the address the signaling reverse proxy listens on.
+// Falls back to a loopback default when unset so the gate is always reachable
+// from main.go without a config tweak.
+func (c *Config) SignalGateAddr() string {
+	if c.Signal.Addr != "" {
+		return c.Signal.Addr
+	}
+	return "127.0.0.1:7883"
+}
+
+// CascadingSFUEnabled reports whether cluster discovery should be rendered.
+// Centralises the nil-check on the *bool so other layers don't replicate it.
+func (c *Config) CascadingSFUEnabled() bool {
+	return c.Media.CascadingSFU != nil && *c.Media.CascadingSFU
 }
 
 // Validate enforces the invariants that, if violated, would make the box
@@ -196,6 +297,17 @@ func (c *Config) Validate() error {
 	}
 	if c.Media.TopNAudioMix <= 0 {
 		return errors.New("vulos-meet: media.top_n_audio_mix must be > 0")
+	}
+	// NOTE on cascading SFU validation: when cascading_sfu is explicitly
+	// enabled in YAML but cluster.redis.addr is empty, that is a user error
+	// and we fail fast. But the default is cascading_sfu=true (operators
+	// rarely flip it off), so we tolerate "defaulted true + no redis" by
+	// downgrading to a no-op render at supervise time — see
+	// CascadingSFUEnabled() and renderClusterBlock(). The explicit-but-
+	// unconfigured case is checked downstream when CascadingSFUExplicit is
+	// set; that wiring is captured in the parse path below.
+	if c.cascadingExplicit && c.CascadingSFUEnabled() && c.Cluster.Redis.Addr == "" {
+		return errors.New("vulos-meet: media.cascading_sfu is on but cluster.redis.addr is empty")
 	}
 	return nil
 }

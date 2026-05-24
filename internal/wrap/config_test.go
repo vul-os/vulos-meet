@@ -28,6 +28,10 @@ media:
   top_n_audio_mix: 3
   active_speaker: true
   cascading_sfu: true
+cluster:
+  redis:
+    addr: redis.internal:6379
+  node_id: meet-test-1
 recording:
   egress_endpoint: https://meet-egress.vulos.example/v1/webhook
 `
@@ -101,12 +105,12 @@ admin:
 func TestConfig_RejectsMissingRequired(t *testing.T) {
 	_ = os.Unsetenv(AdminTokenEnv)
 	cases := map[string]string{
-		"missing region":   `livekit: { api_key: k, api_secret: s }` + "\nadmin: { token: t }\n",
-		"missing api key":  "region: x\nlivekit:\n  api_secret: s\nadmin:\n  token: t\n",
-		"missing secret":   "region: x\nlivekit:\n  api_key: k\nadmin:\n  token: t\n",
-		"missing admin":    "region: x\nlivekit:\n  api_key: k\n  api_secret: s\n",
-		"bad separator":    "region: x\ntenant_separator: \":-\"\nlivekit:\n  api_key: k\n  api_secret: s\nadmin:\n  token: t\n",
-		"unknown field":    "region: x\nlivekit:\n  api_key: k\n  api_secret: s\nadmin:\n  token: t\nshoes: red\n",
+		"missing region":  `livekit: { api_key: k, api_secret: s }` + "\nadmin: { token: t }\n",
+		"missing api key": "region: x\nlivekit:\n  api_secret: s\nadmin:\n  token: t\n",
+		"missing secret":  "region: x\nlivekit:\n  api_key: k\nadmin:\n  token: t\n",
+		"missing admin":   "region: x\nlivekit:\n  api_key: k\n  api_secret: s\n",
+		"bad separator":   "region: x\ntenant_separator: \":-\"\nlivekit:\n  api_key: k\n  api_secret: s\nadmin:\n  token: t\n",
+		"unknown field":   "region: x\nlivekit:\n  api_key: k\n  api_secret: s\nadmin:\n  token: t\nshoes: red\n",
 	}
 	for name, raw := range cases {
 		if _, err := ParseConfig([]byte(raw)); err == nil {

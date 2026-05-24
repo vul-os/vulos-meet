@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	josejwt "github.com/go-jose/go-jose/v3/jwt"
 	jose "github.com/go-jose/go-jose/v3"
+	josejwt "github.com/go-jose/go-jose/v3/jwt"
 	"github.com/livekit/protocol/auth"
 )
 

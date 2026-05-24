@@ -32,11 +32,11 @@ type RoomService interface {
 // vulos-cloud georoute layer (CLOUD-REGION-01) polls this to discover which
 // regions a tenant can be steered to.
 type AdminHealth struct {
-	Status    string `json:"status"`     // "ok" while we are accepting traffic
-	Version   string `json:"version"`    // build version of this binary
-	Region    string `json:"region"`     // e.g. "za-jhb", "eu-fra"
-	Protocol  string `json:"protocol"`   // VULOS-MEET/<n>
-	Separator string `json:"separator"`  // tenant separator byte (": " is "}":")
+	Status    string `json:"status"`    // "ok" while we are accepting traffic
+	Version   string `json:"version"`   // build version of this binary
+	Region    string `json:"region"`    // e.g. "za-jhb", "eu-fra"
+	Protocol  string `json:"protocol"`  // VULOS-MEET/<n>
+	Separator string `json:"separator"` // tenant separator byte (": " is "}":")
 }
 
 // AdminServer is the HTTP surface for vulos-meet admin operations. It is
@@ -49,6 +49,7 @@ type AdminServer struct {
 	geo        *GeoRouter
 	adminToken string
 	version    string
+	metrics    *Metrics // optional — nil disables metrics emission
 }
 
 // NewAdminServer constructs the admin surface. adminToken MUST be non-empty
@@ -78,15 +79,26 @@ func NewAdminServer(tenant *Tenant, rooms RoomService, geo *GeoRouter, adminToke
 	}, nil
 }
 
+// SetMetrics attaches a metrics registry. Calling with nil clears the
+// attachment. Metrics are optional — every admin code path tolerates a nil
+// registry. We keep the wiring opt-in so unit tests don't have to set up a
+// metrics scrape target for every assertion.
+func (s *AdminServer) SetMetrics(m *Metrics) {
+	s.metrics = m
+}
+
 // Handler returns the http.Handler registering all /admin routes. The router
 // is kept in this method (not as a free function) so callers can mount the
 // admin surface under a sub-path if they want.
+//
+// If a metrics registry has been attached via SetMetrics, every response is
+// counted under vulos_meet_admin_requests_total{status="..."}.
 func (s *AdminServer) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /admin/health", s.handleHealth)
 	mux.HandleFunc("GET /admin/tenants/{tenant}/rooms", s.guardedTenant(s.handleListRooms))
 	mux.HandleFunc("DELETE /admin/tenants/{tenant}/rooms/{room}", s.guardedTenant(s.handleDeleteRoom))
-	return mux
+	return instrumentAdmin(s.metrics, mux)
 }
 
 // guardedTenant wraps a handler with admin-token auth + tenant-path
@@ -179,6 +191,10 @@ func (s *AdminServer) handleListRooms(w http.ResponseWriter, r *http.Request, te
 	for _, r := range mine {
 		short = append(short, strings.TrimPrefix(r, prefix))
 	}
+	// Feed the per-tenant active-rooms gauge. This is the natural cardinality
+	// moment: we already have an authenticated tenant in hand and a fresh
+	// count, with no extra LiveKit RPCs.
+	s.metrics.SetActiveRooms(tenant, len(short))
 	writeJSON(w, http.StatusOK, listRoomsResponse{Tenant: tenant, Rooms: short})
 }
 

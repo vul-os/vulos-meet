@@ -17,14 +17,14 @@ const SubprotocolVersion = "VULOS-MEET/1"
 // Token-validation errors. Callers (HTTP gate, signaling reverse proxy) MUST
 // map these to 401/403 with no token contents in the response body.
 var (
-	ErrTokenMalformed      = errors.New("vulos-meet: token is malformed")
-	ErrTokenWrongAPIKey    = errors.New("vulos-meet: token was minted with an unknown API key")
-	ErrTokenSignatureBad   = errors.New("vulos-meet: token signature does not verify")
-	ErrTokenMissingGrants  = errors.New("vulos-meet: token carries no video grants")
-	ErrTokenMissingRoom    = errors.New("vulos-meet: token grants no room")
-	ErrTokenWrongTenant    = errors.New("vulos-meet: token tenant does not match token room prefix")
-	ErrTokenMissingTenant  = errors.New("vulos-meet: token has no tenant audience")
-	ErrTokenRoomMalformed  = errors.New("vulos-meet: token room id is malformed")
+	ErrTokenMalformed     = errors.New("vulos-meet: token is malformed")
+	ErrTokenWrongAPIKey   = errors.New("vulos-meet: token was minted with an unknown API key")
+	ErrTokenSignatureBad  = errors.New("vulos-meet: token signature does not verify")
+	ErrTokenMissingGrants = errors.New("vulos-meet: token carries no video grants")
+	ErrTokenMissingRoom   = errors.New("vulos-meet: token grants no room")
+	ErrTokenWrongTenant   = errors.New("vulos-meet: token tenant does not match token room prefix")
+	ErrTokenMissingTenant = errors.New("vulos-meet: token has no tenant audience")
+	ErrTokenRoomMalformed = errors.New("vulos-meet: token room id is malformed")
 )
 
 // Validator validates VULOS-MEET/1 tokens.
@@ -47,6 +47,7 @@ type Validator struct {
 	apiKey    string
 	apiSecret string
 	tenant    *Tenant
+	metrics   *Metrics // optional — nil disables outcome observation
 }
 
 // NewValidator builds a validator bound to the shared LiveKit API key/secret
@@ -62,6 +63,14 @@ func NewValidator(apiKey, apiSecret string, tenant *Tenant) (*Validator, error) 
 		return nil, errors.New("vulos-meet: validator requires a tenant gate")
 	}
 	return &Validator{apiKey: apiKey, apiSecret: apiSecret, tenant: tenant}, nil
+}
+
+// SetMetrics attaches a metrics registry. Calling with nil clears the
+// attachment. Metrics are optional — Validate tolerates a nil registry. We
+// keep this opt-in so unit tests of the validator don't have to wire a
+// metrics scrape target for every assertion.
+func (v *Validator) SetMetrics(m *Metrics) {
+	v.metrics = m
 }
 
 // ValidatedToken is the result of a successful Validator.Validate call.
@@ -80,7 +89,8 @@ type ValidatedToken struct {
 // invariant. On success the returned token is safe to forward to LiveKit
 // Server. On any failure no information about the token's contents is
 // returned to the caller — only the typed sentinel error.
-func (v *Validator) Validate(raw string) (*ValidatedToken, error) {
+func (v *Validator) Validate(raw string) (vt *ValidatedToken, err error) {
+	defer func() { v.metrics.ObserveTokenValidation(err) }()
 	parsed, err := auth.ParseAPIToken(raw)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrTokenMalformed, err)
