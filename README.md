@@ -127,8 +127,8 @@ is delivered, propagating cleanly to the child).
 
 The default production target is **self-hosted LiveKit on Fly.io**. Fly is used
 because the SFU carries WebRTC audio/video over **raw UDP**, which Fly supports
-and Koyeb does not (UDP is exactly what broke the media plane on Koyeb). A
-[`fly.toml`](fly.toml) is included as the shared per-region template.
+(dedicated IPv4 required — see below). A [`fly.toml`](fly.toml) is included as
+the shared per-region template.
 
 ```bash
 # One Fly app per region (vulos-meet-<region>); georoute steers tenants.

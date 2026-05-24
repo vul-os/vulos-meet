@@ -3,8 +3,8 @@
 # vulos-meet is the video-meetings server: a small Go wrapper (cmd/vulos-meet)
 # that SUPERVISES an upstream `livekit-server` child process and fronts it with
 # a VULOS-MEET/1 signal-gate. It is deployed on Fly because the LiveKit SFU
-# needs raw **UDP** for WebRTC media — Fly supports UDP, Koyeb does not (UDP is
-# exactly what broke the SFU + relay on Koyeb; see vulos-cloud Wave R).
+# needs raw **UDP** for WebRTC media, which Fly supports (a dedicated IPv4 is
+# required to serve UDP — see the FLY UDP REQUIREMENTS section below).
 #
 # This file mirrors the relay's backend/relay/fly.toml structure.
 #
@@ -82,7 +82,7 @@ primary_region = "PLACEHOLDER"   # set to the Fly region code for this box
 # LiveKit's SFU carries audio/video over a UDP port range (rtc.port_range_start
 # .. port_range_end in the generated LiveKit config; vulos-meet defaults are
 # 50000-60000 — see internal/wrap/config.go). THIS is the port range that needs
-# UDP on Fly and was impossible on Koyeb.
+# UDP on Fly.
 #
 # ── FLY UDP REQUIREMENTS (read before first deploy) ───────────────────────────
 #   1. DEDICATED IPv4 — UDP cannot be served from a shared IP:
