@@ -112,6 +112,12 @@ func run(configPath, adminAddrOverride, metricsAddrOverride string) error {
 	if err != nil {
 		return err
 	}
+	// Enforce the per-box concurrent-room ceiling at the gate. LiveKit's config
+	// has auto_create:true, so a join to a not-yet-existing room would otherwise
+	// create it unbounded; the gate is the reliable enforcement point. A join to
+	// an already-active room is unaffected (cfg.Room.MaxRooms <= 0 = unbounded).
+	// Reuses the same RoomService the admin surface lists with — no extra deps.
+	signalGate.SetRoomCap(rooms, cfg.Room.MaxRooms, metrics)
 
 	// Egress Twirp reverse proxy: validates VULOS-MEET/1 tokens with the
 	// per-egress RoomRecord grant invariant before forwarding the body

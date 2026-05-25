@@ -4,11 +4,13 @@
 package wrap
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"strings"
+	"time"
 )
 
 // SignalGate is the front-side WebSocket reverse proxy that sits in front of
@@ -32,6 +34,53 @@ type SignalGate struct {
 	validator *Validator
 	upstream  *url.URL
 	proxy     *httputil.ReverseProxy
+
+	// Room-cap enforcement (optional). When roomCap.max > 0 and roomCap.lister
+	// is non-nil, a join that would create a NEW room (a room id not currently
+	// active) is REJECTED once the box-wide active-room count has reached the
+	// ceiling. Joins to an already-active room are never affected, and the cap
+	// is never consulted at all when max <= 0 (explicitly unbounded). See
+	// SetRoomCap and enforceRoomCap.
+	roomCap roomCapEnforcer
+}
+
+// RoomLister is the narrow read-only surface the signal-gate needs to count
+// active rooms for the MaxRooms ceiling. The production *LiveKitRoomService
+// (and the test MemoryRoomService) both satisfy it via the RoomService
+// interface; we take only the list capability here so the gate can never be
+// coaxed into mutating room state.
+type RoomLister interface {
+	ListRoomIDs(ctx context.Context) ([]string, error)
+}
+
+// roomCapEnforcer bundles the per-box concurrent-room ceiling, the lister used
+// to observe the live count, an optional metrics sink, and the call timeout.
+type roomCapEnforcer struct {
+	max     int
+	lister  RoomLister
+	metrics *Metrics
+	timeout time.Duration
+}
+
+// roomCapListTimeout caps how long the gate will wait on the RoomService list
+// when deciding admission. Kept short: this sits on the connection-setup hot
+// path, and a stalled list must not hang the join indefinitely. The fail-open
+// vs fail-closed choice on timeout is documented in enforceRoomCap.
+const roomCapListTimeout = 3 * time.Second
+
+// SetRoomCap wires concurrent-room-ceiling enforcement into the gate. lister is
+// the read-only room counter (the same RoomService the admin surface uses);
+// max is the ceiling (a value <= 0 means "unbounded" — enforcement is a no-op);
+// metrics is optional. Call once at startup, before serving. When configured,
+// handleRTC rejects a join that would create a NEW room once the box already
+// holds `max` active rooms; joins to an existing room are unaffected.
+func (g *SignalGate) SetRoomCap(lister RoomLister, max int, metrics *Metrics) {
+	g.roomCap = roomCapEnforcer{
+		max:     max,
+		lister:  lister,
+		metrics: metrics,
+		timeout: roomCapListTimeout,
+	}
 }
 
 // NewSignalGate constructs a gate forwarding to the given upstream signaling
@@ -131,8 +180,73 @@ func (g *SignalGate) handleRTC(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	_ = vt // valid; the validated tenant + room are not needed by the proxy itself — livekit-server will re-read them from the same JWT.
+	// Concurrent-room-ceiling enforcement. The token is valid; now decide
+	// admission against the box-wide MaxRooms cap. This is the reliable
+	// enforcement point: LiveKit's config has auto_create:true, so a join to a
+	// not-yet-existing room would otherwise create it on demand with no cap.
+	// A join to an ALREADY-active room never trips the cap (it adds no rooms);
+	// MaxParticipants still bounds that room server-side inside LiveKit.
+	if !g.enforceRoomCap(r.Context(), vt.FullRoom) {
+		http.Error(w, "room capacity reached", http.StatusServiceUnavailable)
+		return
+	}
 	g.proxy.ServeHTTP(w, r)
+}
+
+// enforceRoomCap returns true if the join to fullRoom may proceed and false if
+// it must be rejected because the box is at its concurrent-room ceiling and
+// this join would create a NEW room.
+//
+// Rules:
+//   - No cap configured (lister nil) or max <= 0 → always allow (unbounded).
+//   - fullRoom is already in the active set → always allow (no new room).
+//   - active count < max → allow.
+//   - active count >= max AND fullRoom is new → REJECT.
+//
+// Failure mode: if the list call errors or times out we FAIL CLOSED only when
+// we cannot prove the room already exists — i.e. we reject a would-be NEW room
+// we cannot vet. We deliberately do NOT fail closed for a list error alone if
+// it would also reject existing-room rejoins: we cannot tell new from existing
+// without the list, so a hard list failure rejects the join. This keeps the
+// DoS ceiling intact (the safe direction is to reject when uncertain) at the
+// cost of refusing joins while the RoomService is unreachable; the admin
+// breaker + metrics make that condition observable. See the honest-unknowns
+// note in the change report re: the count-check↔create race.
+func (g *SignalGate) enforceRoomCap(parent context.Context, fullRoom string) bool {
+	rc := g.roomCap
+	if rc.lister == nil || rc.max <= 0 {
+		return true // unbounded / not configured
+	}
+	timeout := rc.timeout
+	if timeout <= 0 {
+		timeout = roomCapListTimeout
+	}
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+	active, err := rc.lister.ListRoomIDs(ctx)
+	if err != nil {
+		// Cannot establish whether this is a new room; reject rather than let
+		// an unbounded number of rooms through while the lister is down.
+		rc.metrics.ObserveRoomAdmission(RoomAdmissionListError)
+		return false
+	}
+	already := false
+	for _, id := range active {
+		if id == fullRoom {
+			already = true
+			break
+		}
+	}
+	if already {
+		rc.metrics.ObserveRoomAdmission(RoomAdmissionExisting)
+		return true
+	}
+	if len(active) >= rc.max {
+		rc.metrics.ObserveRoomAdmission(RoomAdmissionRejectedCapacity)
+		return false
+	}
+	rc.metrics.ObserveRoomAdmission(RoomAdmissionNewRoom)
+	return true
 }
 
 // extractTokenFromRequest pulls the VULOS-MEET/1 JWT out of either the

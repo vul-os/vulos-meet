@@ -148,9 +148,13 @@ type MediaConfig struct {
 //	  so LiveKit itself rejects a join past the cap (server-side enforcement, not
 //	  just a client hint). 0 means "leave to LiveKit's default" (LiveKit treats
 //	  0 as unlimited), so we default it to a sane value below.
-//	MaxRooms — the admin-layer ceiling on how many concurrent rooms this single
-//	  box will tolerate. The admin list/delete surface exposes the live count and
-//	  callers (and the metrics surface) can see when the box is at capacity.
+//	MaxRooms — the gate-enforced ceiling on how many concurrent rooms this single
+//	  box will tolerate. The signal-gate (SignalGate.SetRoomCap) rejects a /rtc
+//	  join that would create a NEW room once the box is at this ceiling, so the
+//	  cap holds even though LiveKit's config has auto_create:true. Joins to an
+//	  already-active room are unaffected. The admin list/delete surface and the
+//	  metrics surface (vulos_meet_rooms_at_capacity, vulos_meet_room_admission_total)
+//	  expose the live count and the at-capacity condition.
 //
 // The 500-participant tier is achievable only with the single-port UDP mux
 // (RTCUDPPort) — a narrow 50000-50200 range (201 ports) cannot sustain it. The

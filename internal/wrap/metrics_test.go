@@ -15,6 +15,15 @@ import (
 	"github.com/livekit/protocol/auth"
 )
 
+// roomAdmissionCount is a test-only accessor for the unexported room-admission
+// counter, used by the MaxRooms pentest to assert a capacity rejection was
+// recorded on the metrics surface.
+func (m *Metrics) roomAdmissionCount(outcome RoomAdmission) uint64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.roomAdmission[string(outcome)]
+}
+
 func TestMetrics_TokenOutcomeMapping(t *testing.T) {
 	cases := map[error]TokenOutcome{
 		nil:                   TokenOutcomeOK,

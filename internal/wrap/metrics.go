@@ -44,6 +44,12 @@ type Metrics struct {
 	// — one per egress-proxy request, recorded by the EgressProxy.
 	egressRequests map[string]uint64
 
+	// room_admission_total{outcome="new_room"|"existing"|"rejected_capacity"|"list_error"}
+	// — one per token-valid /rtc join that reached the MaxRooms admission
+	// decision, recorded by the signal-gate. "rejected_capacity" counts joins
+	// refused because the box was already at its concurrent-room ceiling.
+	roomAdmission map[string]uint64
+
 	// Static limit gauges, set once at startup via SetRoomLimits. They make the
 	// configured per-room participant cap and per-box room ceiling visible on
 	// the metrics surface so a scrape can correlate active_rooms against the cap.
@@ -82,6 +88,7 @@ func NewMetrics() *Metrics {
 		tokenValidation: make(map[string]uint64),
 		activeRooms:     make(map[string]int),
 		egressRequests:  make(map[string]uint64),
+		roomAdmission:   make(map[string]uint64),
 	}
 }
 
@@ -96,6 +103,28 @@ const (
 	EgressOutcomeBadGateway   EgressOutcome = "bad_gateway"  // upstream unreachable / forward error
 	EgressOutcomeRejected     EgressOutcome = "rejected"     // method not allowed / bad request
 )
+
+// RoomAdmission is the small, bounded set of labels on the room-admission
+// counter recorded by the signal-gate's MaxRooms enforcement.
+type RoomAdmission string
+
+const (
+	RoomAdmissionNewRoom          RoomAdmission = "new_room"          // allowed; created a new room under the cap
+	RoomAdmissionExisting         RoomAdmission = "existing"          // allowed; joined an already-active room
+	RoomAdmissionRejectedCapacity RoomAdmission = "rejected_capacity" // refused; box at MaxRooms and this is a new room
+	RoomAdmissionListError        RoomAdmission = "list_error"        // refused; could not list rooms to decide
+)
+
+// ObserveRoomAdmission records one /rtc join admission decision. Safe from any
+// goroutine; tolerant of a nil receiver.
+func (m *Metrics) ObserveRoomAdmission(outcome RoomAdmission) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.roomAdmission[string(outcome)]++
+}
 
 // SetRoomLimits records the box's configured per-room participant cap and
 // per-box room ceiling as static info gauges. Call once at startup. A zero
@@ -233,6 +262,10 @@ func (m *Metrics) writeText(w io.Writer) {
 	for k, v := range m.egressRequests {
 		egress[k] = v
 	}
+	roomAdm := make(map[string]uint64, len(m.roomAdmission))
+	for k, v := range m.roomAdmission {
+		roomAdm[k] = v
+	}
 	maxParticipants := m.maxParticipants
 	maxRooms := m.maxRooms
 	totalRooms := m.totalRooms
@@ -285,6 +318,18 @@ func (m *Metrics) writeText(w io.Writer) {
 	sort.Strings(eouts)
 	for _, o := range eouts {
 		fmt.Fprintf(w, "vulos_meet_egress_requests_total{outcome=%q} %d\n", o, egress[o])
+	}
+
+	// room_admission_total (counter, outcome-labelled) — the MaxRooms decision.
+	_, _ = io.WriteString(w, "# HELP vulos_meet_room_admission_total Count of token-valid /rtc join admission decisions against the MaxRooms ceiling.\n")
+	_, _ = io.WriteString(w, "# TYPE vulos_meet_room_admission_total counter\n")
+	raouts := make([]string, 0, len(roomAdm))
+	for o := range roomAdm {
+		raouts = append(raouts, o)
+	}
+	sort.Strings(raouts)
+	for _, o := range raouts {
+		fmt.Fprintf(w, "vulos_meet_room_admission_total{outcome=%q} %d\n", o, roomAdm[o])
 	}
 
 	// Room-limit gauges (per-room participant cap + per-box room ceiling + the
