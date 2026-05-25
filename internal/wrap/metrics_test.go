@@ -75,6 +75,66 @@ func TestMetrics_NilSafeCalls(t *testing.T) {
 	m.ObserveAdmin(200)
 	m.ObserveTokenValidation(nil)
 	m.SetActiveRooms("acme", 1)
+	m.ObserveEgress(EgressOutcomeOK)
+	m.SetRoomLimits(50, 100)
+	m.SetTotalRooms(3)
+}
+
+func TestMetrics_EgressAndRoomLimitsExposed(t *testing.T) {
+	m := NewMetrics()
+	m.SetRoomLimits(500, 200) // per-room cap + per-box ceiling
+	m.ObserveEgress(EgressOutcomeOK)
+	m.ObserveEgress(EgressOutcomeOK)
+	m.ObserveEgress(EgressOutcomeForbidden)
+	m.ObserveEgress(EgressOutcomeUnauthorized)
+	m.SetTotalRooms(199) // below the 200 ceiling
+
+	rec := httptest.NewRecorder()
+	m.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	body := rec.Body.String()
+	for _, s := range []string{
+		`vulos_meet_egress_requests_total{outcome="ok"} 2`,
+		`vulos_meet_egress_requests_total{outcome="forbidden"} 1`,
+		`vulos_meet_egress_requests_total{outcome="unauthorized"} 1`,
+		`vulos_meet_max_participants 500`,
+		`vulos_meet_max_rooms 200`,
+		`vulos_meet_total_rooms 199`,
+		`vulos_meet_rooms_at_capacity 0`,
+	} {
+		if !strings.Contains(body, s) {
+			t.Fatalf("missing %q in:\n%s", s, body)
+		}
+	}
+}
+
+func TestMetrics_RoomsAtCapacityFlips(t *testing.T) {
+	m := NewMetrics()
+	m.SetRoomLimits(50, 100)
+
+	scrape := func() string {
+		rec := httptest.NewRecorder()
+		m.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+		return rec.Body.String()
+	}
+
+	m.SetTotalRooms(99)
+	if !strings.Contains(scrape(), "vulos_meet_rooms_at_capacity 0") {
+		t.Fatalf("below ceiling should not be at capacity")
+	}
+	m.SetTotalRooms(100) // reaches the ceiling
+	if !strings.Contains(scrape(), "vulos_meet_rooms_at_capacity 1") {
+		t.Fatalf("at ceiling should flip rooms_at_capacity to 1")
+	}
+
+	// Unbounded ceiling (0) never trips.
+	m2 := NewMetrics()
+	m2.SetRoomLimits(50, 0)
+	m2.SetTotalRooms(100000)
+	rec := httptest.NewRecorder()
+	m2.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	if !strings.Contains(rec.Body.String(), "vulos_meet_rooms_at_capacity 0") {
+		t.Fatalf("unbounded ceiling must never flip at-capacity")
+	}
 }
 
 func TestMetrics_AdminInstrumentation_CountsResponses(t *testing.T) {

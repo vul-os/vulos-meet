@@ -39,6 +39,21 @@ type Metrics struct {
 	// every successful list. A list call is the right cardinality moment
 	// (we already have an authenticated tenant in hand and a fresh count).
 	activeRooms map[string]int
+
+	// egress_requests_total{outcome="ok"|"unauthorized"|"forbidden"|"bad_gateway"|"rejected"}
+	// — one per egress-proxy request, recorded by the EgressProxy.
+	egressRequests map[string]uint64
+
+	// Static limit gauges, set once at startup via SetRoomLimits. They make the
+	// configured per-room participant cap and per-box room ceiling visible on
+	// the metrics surface so a scrape can correlate active_rooms against the cap.
+	maxParticipants int
+	maxRooms        int
+
+	// rooms_at_capacity — 1 when the latest observed total room count across all
+	// tenants reached/exceeded maxRooms, else 0. Refreshed on each admin list.
+	totalRooms      int
+	roomsAtCapacity int
 }
 
 // TokenOutcome is the (small) set of outcome labels we expose on the
@@ -66,7 +81,44 @@ func NewMetrics() *Metrics {
 		adminRequests:   make(map[int]uint64),
 		tokenValidation: make(map[string]uint64),
 		activeRooms:     make(map[string]int),
+		egressRequests:  make(map[string]uint64),
 	}
+}
+
+// EgressOutcome is the small, bounded set of labels on the egress-requests
+// counter. Bounded by construction so the metric never explodes cardinality.
+type EgressOutcome string
+
+const (
+	EgressOutcomeOK           EgressOutcome = "ok"           // forwarded; upstream answered
+	EgressOutcomeUnauthorized EgressOutcome = "unauthorized" // missing/invalid token
+	EgressOutcomeForbidden    EgressOutcome = "forbidden"    // wrong tenant / missing RoomRecord
+	EgressOutcomeBadGateway   EgressOutcome = "bad_gateway"  // upstream unreachable / forward error
+	EgressOutcomeRejected     EgressOutcome = "rejected"     // method not allowed / bad request
+)
+
+// SetRoomLimits records the box's configured per-room participant cap and
+// per-box room ceiling as static info gauges. Call once at startup. A zero
+// value leaves the gauge at zero (meaning "unset/unbounded" in the scrape).
+func (m *Metrics) SetRoomLimits(maxParticipants, maxRooms int) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.maxParticipants = maxParticipants
+	m.maxRooms = maxRooms
+}
+
+// ObserveEgress records one egress-proxy request outcome. Safe from any
+// goroutine; tolerant of a nil receiver.
+func (m *Metrics) ObserveEgress(outcome EgressOutcome) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.egressRequests[string(outcome)]++
 }
 
 // ObserveAdmin records one admin response with the given HTTP status code.
@@ -103,6 +155,25 @@ func (m *Metrics) SetActiveRooms(tenant string, n int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.activeRooms[tenant] = n
+}
+
+// SetTotalRooms records the box-wide total room count (across all tenants) and
+// recomputes the rooms_at_capacity flag against the configured maxRooms ceiling.
+// The admin list handler is the natural place to call it: it already lists every
+// room on the box before filtering to a tenant. A maxRooms of 0 ("unbounded")
+// never trips the capacity flag.
+func (m *Metrics) SetTotalRooms(total int) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.totalRooms = total
+	if m.maxRooms > 0 && total >= m.maxRooms {
+		m.roomsAtCapacity = 1
+	} else {
+		m.roomsAtCapacity = 0
+	}
 }
 
 // TokenOutcomeFromErr maps a Validator.Validate error to a stable outcome
@@ -158,6 +229,14 @@ func (m *Metrics) writeText(w io.Writer) {
 	for k, v := range m.activeRooms {
 		rooms[k] = v
 	}
+	egress := make(map[string]uint64, len(m.egressRequests))
+	for k, v := range m.egressRequests {
+		egress[k] = v
+	}
+	maxParticipants := m.maxParticipants
+	maxRooms := m.maxRooms
+	totalRooms := m.totalRooms
+	roomsAtCapacity := m.roomsAtCapacity
 	m.mu.Unlock()
 
 	// admin_requests_total
@@ -195,6 +274,37 @@ func (m *Metrics) writeText(w io.Writer) {
 	for _, t := range tenants {
 		fmt.Fprintf(w, "vulos_meet_active_rooms{tenant=%q} %d\n", escapeLabel(t), rooms[t])
 	}
+
+	// egress_requests_total (counter, outcome-labelled)
+	_, _ = io.WriteString(w, "# HELP vulos_meet_egress_requests_total Count of egress-proxy requests by outcome.\n")
+	_, _ = io.WriteString(w, "# TYPE vulos_meet_egress_requests_total counter\n")
+	eouts := make([]string, 0, len(egress))
+	for o := range egress {
+		eouts = append(eouts, o)
+	}
+	sort.Strings(eouts)
+	for _, o := range eouts {
+		fmt.Fprintf(w, "vulos_meet_egress_requests_total{outcome=%q} %d\n", o, egress[o])
+	}
+
+	// Room-limit gauges (per-room participant cap + per-box room ceiling + the
+	// live total + an at-capacity flag). These let a scrape correlate the
+	// configured caps against the observed room count.
+	_, _ = io.WriteString(w, "# HELP vulos_meet_max_participants Configured per-room participant cap rendered into LiveKit room.max_participants.\n")
+	_, _ = io.WriteString(w, "# TYPE vulos_meet_max_participants gauge\n")
+	fmt.Fprintf(w, "vulos_meet_max_participants %d\n", maxParticipants)
+
+	_, _ = io.WriteString(w, "# HELP vulos_meet_max_rooms Configured per-box concurrent-room ceiling enforced at the admin layer.\n")
+	_, _ = io.WriteString(w, "# TYPE vulos_meet_max_rooms gauge\n")
+	fmt.Fprintf(w, "vulos_meet_max_rooms %d\n", maxRooms)
+
+	_, _ = io.WriteString(w, "# HELP vulos_meet_total_rooms Total rooms across all tenants observed on the most recent admin list.\n")
+	_, _ = io.WriteString(w, "# TYPE vulos_meet_total_rooms gauge\n")
+	fmt.Fprintf(w, "vulos_meet_total_rooms %d\n", totalRooms)
+
+	_, _ = io.WriteString(w, "# HELP vulos_meet_rooms_at_capacity 1 when the box has reached its configured max_rooms ceiling, else 0.\n")
+	_, _ = io.WriteString(w, "# TYPE vulos_meet_rooms_at_capacity gauge\n")
+	fmt.Fprintf(w, "vulos_meet_rooms_at_capacity %d\n", roomsAtCapacity)
 }
 
 // escapeLabel applies the Prometheus exposition-format escapes required for

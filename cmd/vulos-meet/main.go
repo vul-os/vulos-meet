@@ -92,6 +92,11 @@ func run(configPath, adminAddrOverride, metricsAddrOverride string) error {
 	}
 	admin.SetMetrics(metrics)
 
+	// Surface the configured room ceilings on the metrics surface so a scrape
+	// can correlate active rooms against the per-room participant cap and the
+	// per-box room ceiling.
+	metrics.SetRoomLimits(cfg.Room.MaxParticipants, cfg.Room.MaxRooms)
+
 	// Validator is the admission seam used by the signaling reverse proxy.
 	// We construct it here so a malformed key/secret pair fails fast at
 	// startup instead of at first connection.
@@ -118,6 +123,7 @@ func run(configPath, adminAddrOverride, metricsAddrOverride string) error {
 	if err != nil {
 		return err
 	}
+	egressProxy.SetMetrics(metrics)
 
 	// Egress webhook receiver: forwards LiveKit egress events to the cloud
 	// (MEET-RECORDING-01) after verifying the LiveKit signature.

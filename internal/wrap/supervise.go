@@ -81,16 +81,31 @@ func writeLiveKitConfig(cfg *Config, path string) error {
 	// Render the LiveKit config inline. We do this with a string template
 	// (not the LiveKit Go types) so we don't pull livekit-server as a Go
 	// dep. The schema below matches LiveKit Server's documented YAML.
+	// Bind the child to loopback, not the wildcard. We render only the PORT
+	// from SignalingAddr (an operator may write ":7880" or "0.0.0.0:7880"), and
+	// always pin `bind_addresses: [127.0.0.1]` so livekit-server's signaling
+	// listener is reachable ONLY from this host (the public-facing surface is
+	// the VULOS-MEET/1 signal-gate, which proxies to loopback). Before this,
+	// rendering only `port:` let LiveKit default to binding all interfaces.
+	signalPort := portFromAddr(cfg.LiveKit.SignalingAddr)
 	doc := "" +
-		"port: " + portFromAddr(cfg.LiveKit.SignalingAddr) + "\n" +
+		"port: " + signalPort + "\n" +
+		"bind_addresses:\n" +
+		"  - 127.0.0.1\n" +
 		"rtc:\n" +
-		"  port_range_start: " + strconv.Itoa(cfg.LiveKit.RTCPortRangeStart) + "\n" +
-		"  port_range_end: " + strconv.Itoa(cfg.LiveKit.RTCPortRangeEnd) + "\n" +
+		// UDP transport: single-port mux (rtc.udp_port) when configured, else
+		// the port range. These are mutually exclusive — see Config.RTCUDPPort
+		// and Validate. The mux is what makes the 500-participant tier viable
+		// on Fly (one UDP port to expose) instead of a wide range.
+		renderRTCUDP(cfg) +
 		"  use_external_ip: true\n" +
 		"keys:\n" +
 		"  " + cfg.LiveKit.APIKey + ": " + cfg.LiveKit.APISecret + "\n" +
 		"room:\n" +
 		"  auto_create: true\n" +
+		// Per-room participant cap enforced server-side by LiveKit: a join past
+		// this is rejected by the SFU itself, not merely discouraged on clients.
+		"  max_participants: " + strconv.Itoa(maxParticipants(cfg)) + "\n" +
 		"  enabled_codecs:\n" +
 		"    - mime: video/" + cfg.Media.Codec + "\n" +
 		"    - mime: video/H264\n" +
@@ -122,6 +137,31 @@ func writeLiveKitConfig(cfg *Config, path string) error {
 		doc += block
 	}
 	return os.WriteFile(path, []byte(doc), 0o600)
+}
+
+// renderRTCUDP emits the indented LiveKit `rtc:` UDP transport lines: either a
+// single muxed `udp_port` (when cfg.LiveKit.RTCUDPPort > 0) or the
+// `port_range_start`/`port_range_end` pair. Exactly one of the two shapes is
+// rendered (Validate guarantees they are mutually exclusive). Each returned
+// line is already indented two spaces to sit under `rtc:`.
+func renderRTCUDP(cfg *Config) string {
+	if cfg.LiveKit.RTCUDPPort > 0 {
+		return "  udp_port: " + strconv.Itoa(cfg.LiveKit.RTCUDPPort) + "\n"
+	}
+	return "" +
+		"  port_range_start: " + strconv.Itoa(cfg.LiveKit.RTCPortRangeStart) + "\n" +
+		"  port_range_end: " + strconv.Itoa(cfg.LiveKit.RTCPortRangeEnd) + "\n"
+}
+
+// maxParticipants returns the per-room participant cap to render into LiveKit's
+// room.max_participants. Falls back to DefaultMaxParticipants when unset so a
+// box always carries a finite cap (LiveKit treats 0 as unlimited, which we do
+// not want as a silent default).
+func maxParticipants(cfg *Config) int {
+	if cfg.Room.MaxParticipants > 0 {
+		return cfg.Room.MaxParticipants
+	}
+	return DefaultMaxParticipants
 }
 
 // portFromAddr extracts the port from ":7880" or "0.0.0.0:7880". Returns the

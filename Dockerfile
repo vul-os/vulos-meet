@@ -56,9 +56,17 @@ ENV VULOS_MEET_LIVEKIT_BIN=/usr/local/bin/livekit-server
 
 # Public signal-gate (HTTP/WS). Admin :7881 + metrics :7882 stay internal (not
 # EXPOSEd as Fly services — see fly.toml). RTC media is UDP, served by
-# livekit-server on the range below (must match fly.toml's UDP service + the
-# rendered config's rtc_port_range_*).
+# livekit-server.
+#
+# Two transport shapes (pick ONE; keep consistent with config.yaml + fly.toml):
+#   (a) NARROW RANGE (default): rtc_port_range_start/end 50000-50200.
+#   (b) SINGLE UDP MUX PORT (500-participant tier): livekit.rtc_udp_port: 50000
+#       — then EXPOSE the single port "50000/udp" instead of the range.
+# EXPOSE is documentation-only for Fly (the [[services]] block in fly.toml is
+# what actually opens the port), but we keep it accurate for plain `docker run`.
 EXPOSE 7883
 EXPOSE 50000-50200/udp
+# Shape (b): replace the range line above with the single muxed port:
+# EXPOSE 50000/udp
 
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]

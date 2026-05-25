@@ -191,10 +191,12 @@ func (s *AdminServer) handleListRooms(w http.ResponseWriter, r *http.Request, te
 	for _, r := range mine {
 		short = append(short, strings.TrimPrefix(r, prefix))
 	}
-	// Feed the per-tenant active-rooms gauge. This is the natural cardinality
-	// moment: we already have an authenticated tenant in hand and a fresh
-	// count, with no extra LiveKit RPCs.
+	// Feed the per-tenant active-rooms gauge AND the box-wide total. This is the
+	// natural cardinality moment: we already have an authenticated tenant in
+	// hand, a fresh per-tenant count, and the full box-wide room list (`all`)
+	// for the per-box ceiling — all with no extra LiveKit RPCs.
 	s.metrics.SetActiveRooms(tenant, len(short))
+	s.metrics.SetTotalRooms(len(all))
 	writeJSON(w, http.StatusOK, listRoomsResponse{Tenant: tenant, Rooms: short})
 }
 

@@ -98,33 +98,53 @@ primary_region = "PLACEHOLDER"   # set to the Fly region code for this box
 #      fly-global-services interface; on a single-port setup LiveKit can also use
 #      a single `rtc.udp_port` instead of the range. See "port-range caveat".
 #
-# ── PORT-RANGE CAVEAT (honest unknown) ────────────────────────────────────────
+# ── PORT-RANGE CAVEAT (and the 500-participant tier) ──────────────────────────
 # Fly UDP services declare an explicit port (or start_port/end_port range). A
 # full 50000-60000 (10k ports) UDP range is impractical to enumerate and is
-# heavier than a single-region SFU needs. Two supported shapes:
+# heavier than a single-region SFU needs. Two supported shapes — pick ONE and
+# keep config.yaml and this file consistent (the wrap REJECTS setting both):
 #
-#   (a) NARROW RANGE (recommended): shrink LiveKit's rtc.port_range_* to a small
-#       window (e.g. 50000-50200) in config.yaml AND mirror it here. Each Fly
-#       machine handles ~its share of concurrent media streams; scale out with
-#       more machines/regions rather than a wider range.
-#   (b) SINGLE UDP MUX PORT: set LiveKit `rtc.udp_port` to one port (e.g. 7882…
-#       pick a free one, NOT the metrics port) and `rtc.port_range_*` unset, so
-#       all media muxes over one UDP port. Simplest on Fly; expose just that one
-#       UDP port below.
+#   (a) NARROW RANGE: set livekit.rtc_port_range_start/end to a small window
+#       (e.g. 50000-50200) in config.yaml AND mirror it in the [[services]]
+#       block below. NOTE: 50000-50200 is only ~201 ports — that does NOT
+#       sustain a 500-participant room. Use this shape only for modest rooms,
+#       and scale out with more machines/regions rather than a wider range.
+#   (b) SINGLE UDP MUX PORT (REQUIRED for the 500-participant tier): set
+#       livekit.rtc_udp_port to ONE port (e.g. 50000 — NOT the metrics port
+#       7882) and leave rtc_port_range_* unset. The wrap then renders LiveKit's
+#       `rtc.udp_port`, so ALL media for every participant muxes over that one
+#       UDP port. Expose just that single UDP port below. This is the only way
+#       to honestly claim hundreds of participants on Fly without enumerating
+#       hundreds of ports. With shape (b) you may raise room.max_participants
+#       toward 500 in config.yaml.
 #
-# The block below uses shape (a) with a NARROW 50000-50200 range. **Confirm the
-# exact range against Fly's current UDP port-range support and your concurrency
-# target before production** — Fly's per-app UDP port-range limits are the main
-# unknown here. Whatever you choose, config.yaml's rtc.port_range_* MUST match.
+# The DEFAULT block below uses shape (a) with a NARROW 50000-50200 range and
+# config.yaml's conservative room.max_participants default (50). To run the
+# 500-participant tier, switch to shape (b): comment out the range block below,
+# uncomment the single-port block, set livekit.rtc_udp_port: 50000 and
+# room.max_participants: 500 in config.yaml.
+#
+# ── shape (a): NARROW RANGE (default) ─────────────────────────────────────────
 [[services]]
   protocol      = "udp"
   internal_port = 50000        # media range start inside the container
   processes     = ["app"]
 
   [[services.ports]]
-    start_port = 50000         # MUST match LiveKit rtc.port_range_start in config.yaml
-    end_port   = 50200         # MUST match LiveKit rtc.port_range_end   in config.yaml
+    start_port = 50000         # MUST match LiveKit rtc_port_range_start in config.yaml
+    end_port   = 50200         # MUST match LiveKit rtc_port_range_end   in config.yaml
     handlers   = []            # raw UDP — no TLS/HTTP handler; WebRTC media
+
+# ── shape (b): SINGLE UDP MUX PORT (uncomment for the 500-participant tier) ───
+# Set livekit.rtc_udp_port: 50000 in config.yaml (and unset rtc_port_range_*),
+# then replace the [[services]] block above with this one:
+# [[services]]
+#   protocol      = "udp"
+#   internal_port = 50000      # MUST match livekit.rtc_udp_port in config.yaml
+#   processes     = ["app"]
+#   [[services.ports]]
+#     port     = 50000         # single muxed UDP port — all media rides this
+#     handlers = []            # raw UDP — WebRTC media
 
 # ── TURN/UDP (optional fallback) ──────────────────────────────────────────────
 # If LiveKit's embedded TURN is enabled (config.yaml livekit.turn_addr -> the

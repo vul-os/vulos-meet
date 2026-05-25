@@ -57,7 +57,13 @@ type EgressProxy struct {
 	validator *Validator
 	upstream  *url.URL
 	client    *http.Client
+	metrics   *Metrics // optional — nil disables egress metrics emission
 }
+
+// SetMetrics attaches a metrics registry so every egress request feeds the
+// vulos_meet_egress_requests_total counter. Passing nil clears it. Optional
+// (every path tolerates a nil registry) so unit tests need no metrics target.
+func (p *EgressProxy) SetMetrics(m *Metrics) { p.metrics = m }
 
 // EgressTwirpPathPrefix is the path prefix vulos-meet auth-checks and
 // proxies on the signal-gate listener. The cloud's HTTPEgressClient targets
@@ -119,11 +125,13 @@ func (p *EgressProxy) Handler() http.Handler {
 // Response bodies are opaque labels; we never leak token contents.
 func (p *EgressProxy) serve(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
+		p.metrics.ObserveEgress(EgressOutcomeRejected)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 	raw := extractTokenFromRequest(r)
 	if raw == "" {
+		p.metrics.ObserveEgress(EgressOutcomeUnauthorized)
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
@@ -131,11 +139,13 @@ func (p *EgressProxy) serve(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		switch {
 		case errors.Is(err, ErrTokenWrongTenant):
+			p.metrics.ObserveEgress(EgressOutcomeForbidden)
 			http.Error(w, "forbidden", http.StatusForbidden)
 		default:
 			// Map every shape-of-token failure to 401: malformed JWT, wrong
 			// API key, bad signature/exp/nbf, missing grants, missing room,
 			// missing tenant, malformed room. The caller needs a new token.
+			p.metrics.ObserveEgress(EgressOutcomeUnauthorized)
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 		}
 		return
@@ -145,6 +155,7 @@ func (p *EgressProxy) serve(w http.ResponseWriter, r *http.Request) {
 	// join token (no RoomRecord) MUST NOT be replayable here, even on the
 	// caller's own tenant.
 	if vt.Grants == nil || vt.Grants.Video == nil || !vt.Grants.Video.RoomRecord {
+		p.metrics.ObserveEgress(EgressOutcomeForbidden)
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
@@ -161,6 +172,7 @@ func (p *EgressProxy) serve(w http.ResponseWriter, r *http.Request) {
 func (p *EgressProxy) forward(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20)) // 1 MiB cap; Twirp egress payloads are kilobytes
 	if err != nil {
+		p.metrics.ObserveEgress(EgressOutcomeRejected)
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
@@ -172,6 +184,7 @@ func (p *EgressProxy) forward(w http.ResponseWriter, r *http.Request) {
 	}
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(body))
 	if err != nil {
+		p.metrics.ObserveEgress(EgressOutcomeBadGateway)
 		http.Error(w, "bad gateway", http.StatusBadGateway)
 		return
 	}
@@ -187,10 +200,12 @@ func (p *EgressProxy) forward(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := p.client.Do(req)
 	if err != nil {
+		p.metrics.ObserveEgress(EgressOutcomeBadGateway)
 		http.Error(w, "bad gateway", http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
+	p.metrics.ObserveEgress(EgressOutcomeOK)
 
 	// Copy response headers back to the caller, then stream the body.
 	copyForwardableHeaders(w.Header(), resp.Header)

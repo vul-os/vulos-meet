@@ -38,6 +38,11 @@ type Config struct {
 	// active-speaker, cascading SFU).
 	Media MediaConfig `yaml:"media"`
 
+	// Room holds per-room and admin ceiling limits (max participants per room,
+	// max rooms on this box). These are rendered into LiveKit's `room` block
+	// (max_participants) and enforced at the admin layer (max rooms).
+	Room RoomConfig `yaml:"room"`
+
 	// Recording is the hook for vulos-cloud MEET-RECORDING-01. The actual
 	// egress driver lives there; this is just the endpoint URL we hand
 	// LiveKit Server so it knows where to push egress events.
@@ -74,12 +79,28 @@ type LiveKitConfig struct {
 	APISecret string `yaml:"api_secret"`
 
 	// SignalingAddr is the LiveKit signaling listen address (default :7880).
+	// Only the PORT is rendered into the LiveKit config; the child is always
+	// bound to loopback (127.0.0.1:<port>) so the SFU is reachable only via the
+	// public signal-gate, never directly on the public interface.
 	SignalingAddr string `yaml:"signaling_addr"`
 	// RTCPortRangeStart/End is the UDP port range used for RTC media (and
 	// TURN/UDP). LiveKit defaults are sane; we expose them because cloud
 	// deployments often need to coordinate with the firewall layer.
+	//
+	// MUTUALLY EXCLUSIVE with RTCUDPPort: when RTCUDPPort is set (single-port
+	// UDP mux, shape (b) in fly.toml) the range is NOT rendered, so all media
+	// muxes over the one port. Leave RTCUDPPort at 0 to use the range.
 	RTCPortRangeStart int `yaml:"rtc_port_range_start"`
 	RTCPortRangeEnd   int `yaml:"rtc_port_range_end"`
+
+	// RTCUDPPort, when > 0, enables LiveKit's single-port UDP mux (rtc.udp_port)
+	// so ALL WebRTC media for every participant is multiplexed over one UDP
+	// port instead of a wide range. This is shape (b) documented in fly.toml:
+	// the simplest Fly UDP story (expose one port) and the way to actually
+	// sustain hundreds of participants without enumerating hundreds of ports.
+	// When set, the port range is omitted from the rendered config. Default 0
+	// (use the port range).
+	RTCUDPPort int `yaml:"rtc_udp_port"`
 
 	// TURN listen address (e.g. ":3478"). Empty disables TURN.
 	TURNAddr string `yaml:"turn_addr"`
@@ -118,6 +139,41 @@ type MediaConfig struct {
 	ActiveSpeaker   *bool    `yaml:"active_speaker"`
 	CascadingSFU    *bool    `yaml:"cascading_sfu"`
 }
+
+// RoomConfig holds the room-level limits this box enforces.
+//
+// Two distinct ceilings:
+//
+//	MaxParticipants — rendered into the LiveKit config's `room.max_participants`,
+//	  so LiveKit itself rejects a join past the cap (server-side enforcement, not
+//	  just a client hint). 0 means "leave to LiveKit's default" (LiveKit treats
+//	  0 as unlimited), so we default it to a sane value below.
+//	MaxRooms — the admin-layer ceiling on how many concurrent rooms this single
+//	  box will tolerate. The admin list/delete surface exposes the live count and
+//	  callers (and the metrics surface) can see when the box is at capacity.
+//
+// The 500-participant tier is achievable only with the single-port UDP mux
+// (RTCUDPPort) — a narrow 50000-50200 range (201 ports) cannot sustain it. The
+// default here is intentionally conservative; bump MaxParticipants toward 500
+// only on a deploy that has set livekit.rtc_udp_port (see fly.toml shape (b)).
+type RoomConfig struct {
+	// MaxParticipants is the per-room participant cap rendered into LiveKit's
+	// room.max_participants. 0 → default (DefaultMaxParticipants).
+	MaxParticipants int `yaml:"max_participants"`
+
+	// MaxRooms is the admin-enforced ceiling on concurrent rooms for this box.
+	// 0 → default (DefaultMaxRooms). The admin list handler refuses to report a
+	// healthy state past this and the metric vulos_meet_rooms_at_capacity flips.
+	MaxRooms int `yaml:"max_rooms"`
+}
+
+// Default room ceilings. These are deliberately conservative defaults that work
+// on the narrow UDP range; raise MaxParticipants toward the 500 tier only with
+// the single-port UDP mux enabled (livekit.rtc_udp_port).
+const (
+	DefaultMaxParticipants = 50
+	DefaultMaxRooms        = 100
+)
 
 // RecordingConfig is the egress endpoint hook. The actual recording driver
 // (S3 sink, transcode, retention) lives in vulos-cloud MEET-RECORDING-01;
@@ -254,11 +310,22 @@ func (c *Config) applyDefaults() {
 		// LiveKit serves Twirp on the same port as signaling.
 		c.LiveKit.EgressUpstreamAddr = c.LiveKit.SignalingAddr
 	}
-	if c.LiveKit.RTCPortRangeStart == 0 {
-		c.LiveKit.RTCPortRangeStart = 50000
+	// Port-range defaults apply ONLY when the single-port UDP mux is off. With
+	// rtc_udp_port set, the range is irrelevant (and intentionally not rendered),
+	// so we must not silently fabricate one that Validate would then reject.
+	if c.LiveKit.RTCUDPPort == 0 {
+		if c.LiveKit.RTCPortRangeStart == 0 {
+			c.LiveKit.RTCPortRangeStart = 50000
+		}
+		if c.LiveKit.RTCPortRangeEnd == 0 {
+			c.LiveKit.RTCPortRangeEnd = 60000
+		}
 	}
-	if c.LiveKit.RTCPortRangeEnd == 0 {
-		c.LiveKit.RTCPortRangeEnd = 60000
+	if c.Room.MaxParticipants == 0 {
+		c.Room.MaxParticipants = DefaultMaxParticipants
+	}
+	if c.Room.MaxRooms == 0 {
+		c.Room.MaxRooms = DefaultMaxRooms
 	}
 	if c.Admin.Addr == "" {
 		c.Admin.Addr = ":7881"
@@ -304,11 +371,26 @@ func (c *Config) Validate() error {
 	if c.Admin.Token == "" {
 		return errors.New("vulos-meet: admin token is empty (set config.admin.token or " + AdminTokenEnv + ")")
 	}
-	if c.LiveKit.RTCPortRangeStart <= 0 || c.LiveKit.RTCPortRangeEnd <= c.LiveKit.RTCPortRangeStart {
+	// UDP transport: EITHER the single-port mux (rtc_udp_port) OR the port
+	// range, never both — they are mutually exclusive at the LiveKit layer.
+	if c.LiveKit.RTCUDPPort != 0 {
+		if c.LiveKit.RTCUDPPort < 1 || c.LiveKit.RTCUDPPort > 65535 {
+			return errors.New("vulos-meet: livekit.rtc_udp_port must be a valid port (1-65535)")
+		}
+		if c.LiveKit.RTCPortRangeStart != 0 || c.LiveKit.RTCPortRangeEnd != 0 {
+			return errors.New("vulos-meet: set EITHER livekit.rtc_udp_port (single-port mux) OR rtc_port_range_* (range), not both")
+		}
+	} else if c.LiveKit.RTCPortRangeStart <= 0 || c.LiveKit.RTCPortRangeEnd <= c.LiveKit.RTCPortRangeStart {
 		return errors.New("vulos-meet: invalid rtc_port_range_*")
 	}
 	if c.Media.TopNAudioMix <= 0 {
 		return errors.New("vulos-meet: media.top_n_audio_mix must be > 0")
+	}
+	if c.Room.MaxParticipants < 0 {
+		return errors.New("vulos-meet: room.max_participants must be >= 0")
+	}
+	if c.Room.MaxRooms < 0 {
+		return errors.New("vulos-meet: room.max_rooms must be >= 0")
 	}
 	// NOTE on cascading SFU validation: when cascading_sfu is explicitly
 	// enabled in YAML but cluster.redis.addr is empty, that is a user error
