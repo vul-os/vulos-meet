@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -179,12 +180,47 @@ const (
 	DefaultMaxRooms        = 100
 )
 
-// RecordingConfig is the egress endpoint hook. The actual recording driver
-// (S3 sink, transcode, retention) lives in vulos-cloud MEET-RECORDING-01;
-// this is just the URL we hand to LiveKit's egress so it knows where to
-// dispatch events.
+// RecordingConfig is the egress endpoint hook + the retention/lifecycle policy
+// (MEET-RECORDING-RETENTION-06).
+//
+// Boundary: the actual recording BLOB (S3/Tigris object) is owned by the
+// vulos-cloud MEET-RECORDING-01 sink — vulos-meet never holds the bytes.
+// EgressEndpoint is the URL we hand LiveKit's egress so events flow to our
+// webhook receiver (which forwards to the cloud). The retention fields below
+// drive a LOCAL lifecycle ledger + cleanup driver that decides what is
+// past-retention and issues a delete through a seam; when CloudDeleteBaseURL is
+// set, that delete is dispatched to the cloud sink (the blob owner). When it is
+// not, the box runs in self-host mode where there is no central blob to delete.
 type RecordingConfig struct {
+	// EgressEndpoint is the LiveKit egress webhook URL (our receiver).
 	EgressEndpoint string `yaml:"egress_endpoint"`
+
+	// RetentionTTL is the max age (e.g. "720h" = 30d) before a finalised
+	// recording is eligible for deletion. Empty/0 disables the TTL rule.
+	RetentionTTL time.Duration `yaml:"retention_ttl"`
+
+	// RetentionMaxPerRoom caps recordings kept per (tenant, room); the oldest
+	// beyond the cap are eligible for deletion. 0 disables.
+	RetentionMaxPerRoom int `yaml:"retention_max_per_room"`
+
+	// RetentionMaxPerTenant caps a tenant's total recordings across all rooms.
+	// 0 disables.
+	RetentionMaxPerTenant int `yaml:"retention_max_per_tenant"`
+
+	// RetentionSweepInterval is how often the cleanup driver runs (e.g. "1h").
+	// Empty/0 disables the background sweeper (the ledger is still tracked; an
+	// operator can sweep out-of-band). Defaults to 1h when any retention rule
+	// is set but the interval is left unset.
+	RetentionSweepInterval time.Duration `yaml:"retention_sweep_interval"`
+
+	// CloudDeleteBaseURL is the FLAGGED cloud control endpoint that owns the
+	// blob delete. When set, the cleanup driver issues DELETE
+	// {CloudDeleteBaseURL}/v1/recordings/{egress_id} to the cloud sink (which
+	// performs the S3 DeleteObject). Empty → self-host mode (no central blob;
+	// the ledger advances straight to deleted via the no-op deleter). The
+	// bearer token is read from MEET_RECORDING_CLOUD_TOKEN (same family as the
+	// egress forward leg).
+	CloudDeleteBaseURL string `yaml:"cloud_delete_base_url"`
 }
 
 // ClusterConfig is the cascading-SFU discovery configuration. LiveKit uses
@@ -357,6 +393,34 @@ func (c *Config) CascadingSFUEnabled() bool {
 	return c.Media.CascadingSFU != nil && *c.Media.CascadingSFU
 }
 
+// RetentionPolicy projects the recording-retention config into the policy the
+// cleanup driver consumes. A zero policy (all rules unset) retains forever.
+func (c *Config) RetentionPolicy() RetentionPolicy {
+	return RetentionPolicy{
+		TTL:          c.Recording.RetentionTTL,
+		MaxPerRoom:   c.Recording.RetentionMaxPerRoom,
+		MaxPerTenant: c.Recording.RetentionMaxPerTenant,
+	}
+}
+
+// DefaultRetentionSweepInterval is used when a retention rule is configured but
+// the sweep interval is left unset.
+const DefaultRetentionSweepInterval = time.Hour
+
+// RetentionSweepInterval returns the effective sweep interval: the configured
+// value, or DefaultRetentionSweepInterval when a retention rule is active but
+// the interval was not set. Returns 0 when no retention rule is active (the
+// sweeper then never runs).
+func (c *Config) RetentionSweepInterval() time.Duration {
+	if !c.RetentionPolicy().Enabled() {
+		return 0
+	}
+	if c.Recording.RetentionSweepInterval > 0 {
+		return c.Recording.RetentionSweepInterval
+	}
+	return DefaultRetentionSweepInterval
+}
+
 // Validate enforces the invariants that, if violated, would make the box
 // silently unsafe (open admin, no auth, cross-tenant leaks).
 func (c *Config) Validate() error {
@@ -395,6 +459,18 @@ func (c *Config) Validate() error {
 	}
 	if c.Room.MaxRooms < 0 {
 		return errors.New("vulos-meet: room.max_rooms must be >= 0")
+	}
+	if c.Recording.RetentionTTL < 0 {
+		return errors.New("vulos-meet: recording.retention_ttl must be >= 0")
+	}
+	if c.Recording.RetentionMaxPerRoom < 0 {
+		return errors.New("vulos-meet: recording.retention_max_per_room must be >= 0")
+	}
+	if c.Recording.RetentionMaxPerTenant < 0 {
+		return errors.New("vulos-meet: recording.retention_max_per_tenant must be >= 0")
+	}
+	if c.Recording.RetentionSweepInterval < 0 {
+		return errors.New("vulos-meet: recording.retention_sweep_interval must be >= 0")
 	}
 	// NOTE on cascading SFU validation: when cascading_sfu is explicitly
 	// enabled in YAML but cluster.redis.addr is empty, that is a user error

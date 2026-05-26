@@ -60,6 +60,44 @@ type Metrics struct {
 	// tenants reached/exceeded maxRooms, else 0. Refreshed on each admin list.
 	totalRooms      int
 	roomsAtCapacity int
+
+	// participants_in_room{tenant,room} — gauge of current participant count per
+	// room, refreshed on each admin list (which already enumerates rooms with
+	// their participant counts). Cardinality is bounded by the MaxRooms ceiling.
+	participantsInRoom map[roomKey]int
+
+	// egress_lifecycle_total{event="started"|"completed"|"failed"} — one per
+	// egress lifecycle transition observed on the webhook receiver. This is the
+	// in-progress/completed/failed surface the egress_requests_total counter
+	// (which counts PROXY requests) does not provide.
+	egressLifecycle map[string]uint64
+
+	// egress_in_progress — gauge of egresses currently in the recording state
+	// (started minus completed/failed). Derived from egressLifecycle counters.
+	egressInProgress int
+
+	// recording_lifecycle_total{state="recording"|"available"|"failed"|"expired"|"deleted"}
+	// — one per recording-ledger state transition recorded by the receiver and
+	// the retention driver.
+	recordingLifecycle map[string]uint64
+
+	// Recording byte/duration accounting, accumulated as recordings finalise
+	// (available) and as the retention sweep frees them (deleted).
+	recordingBytesTotal    uint64 // cumulative bytes seen on available recordings
+	recordingDurationMsTotal uint64 // cumulative duration ms on available recordings
+
+	// Retention sweep counters, accumulated across cleanup passes.
+	retentionExpiredTotal   uint64
+	retentionDeletedTotal   uint64
+	retentionDeleteErrTotal uint64
+	retentionBytesFreed     uint64
+}
+
+// roomKey is the (tenant, room) composite used as the participants-in-room
+// gauge label set. Bounded cardinality: rooms are capped by MaxRooms.
+type roomKey struct {
+	tenant string
+	room   string
 }
 
 // TokenOutcome is the (small) set of outcome labels we expose on the
@@ -84,11 +122,14 @@ const (
 // NewMetrics returns an empty metrics registry.
 func NewMetrics() *Metrics {
 	return &Metrics{
-		adminRequests:   make(map[int]uint64),
-		tokenValidation: make(map[string]uint64),
-		activeRooms:     make(map[string]int),
-		egressRequests:  make(map[string]uint64),
-		roomAdmission:   make(map[string]uint64),
+		adminRequests:      make(map[int]uint64),
+		tokenValidation:    make(map[string]uint64),
+		activeRooms:        make(map[string]int),
+		egressRequests:     make(map[string]uint64),
+		roomAdmission:      make(map[string]uint64),
+		participantsInRoom: make(map[roomKey]int),
+		egressLifecycle:    make(map[string]uint64),
+		recordingLifecycle: make(map[string]uint64),
 	}
 }
 
@@ -148,6 +189,120 @@ func (m *Metrics) ObserveEgress(outcome EgressOutcome) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.egressRequests[string(outcome)]++
+}
+
+// EgressLifecycle is the bounded label set on the egress-lifecycle counter. It
+// tracks the in-progress/completed/failed transitions of egress jobs (distinct
+// from egress_requests_total, which counts PROXY requests not job outcomes).
+type EgressLifecycle string
+
+const (
+	EgressLifecycleStarted   EgressLifecycle = "started"
+	EgressLifecycleCompleted EgressLifecycle = "completed"
+	EgressLifecycleFailed    EgressLifecycle = "failed"
+)
+
+// SetParticipantsInRoom records the current participant count for one room. The
+// admin list handler is the natural place to call it (it can enumerate rooms
+// with their participant counts in the same RPC). A count <= 0 removes the
+// room's gauge series so a finished room does not linger as a stale 0.
+func (m *Metrics) SetParticipantsInRoom(tenant, room string, n int) {
+	if m == nil || tenant == "" || room == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k := roomKey{tenant: tenant, room: room}
+	if n <= 0 {
+		delete(m.participantsInRoom, k)
+		return
+	}
+	m.participantsInRoom[k] = n
+}
+
+// ResetParticipantsForTenant clears all per-room participant gauges for a tenant
+// before a fresh admin-list refresh repopulates them. This keeps the gauge from
+// retaining rooms that have since closed. Called by the admin list handler.
+func (m *Metrics) ResetParticipantsForTenant(tenant string) {
+	if m == nil || tenant == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for k := range m.participantsInRoom {
+		if k.tenant == tenant {
+			delete(m.participantsInRoom, k)
+		}
+	}
+}
+
+// ObserveEgressLifecycle records one egress job lifecycle transition and keeps
+// the in-progress gauge consistent (started increments it; completed/failed
+// decrement it, floored at 0). Safe from any goroutine; nil-tolerant.
+func (m *Metrics) ObserveEgressLifecycle(ev EgressLifecycle) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.egressLifecycle[string(ev)]++
+	switch ev {
+	case EgressLifecycleStarted:
+		m.egressInProgress++
+	case EgressLifecycleCompleted, EgressLifecycleFailed:
+		if m.egressInProgress > 0 {
+			m.egressInProgress--
+		}
+	}
+}
+
+// ObserveRecordingLifecycle records one recording-ledger state transition and,
+// when a recording becomes available, mirrors it onto the egress-lifecycle
+// counters + the cumulative bytes/duration totals. recording → started,
+// available → completed, failed → failed. expired/deleted feed only the
+// recording counter (the egress job already terminated). Nil-tolerant.
+func (m *Metrics) ObserveRecordingLifecycle(state RecordingState) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.recordingLifecycle[string(state)]++
+	m.mu.Unlock()
+	switch state {
+	case RecordingStateRecording:
+		m.ObserveEgressLifecycle(EgressLifecycleStarted)
+	case RecordingStateAvailable:
+		m.ObserveEgressLifecycle(EgressLifecycleCompleted)
+	case RecordingStateFailed:
+		m.ObserveEgressLifecycle(EgressLifecycleFailed)
+	}
+}
+
+// ObserveRecordingBytes accumulates the byte/duration totals for a finalised
+// recording. Called by the receiver when a recording becomes available with a
+// known size/duration. Nil-tolerant.
+func (m *Metrics) ObserveRecordingBytes(sizeBytes, durationMs uint64) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.recordingBytesTotal += sizeBytes
+	m.recordingDurationMsTotal += durationMs
+}
+
+// ObserveRetentionSweep folds one retention cleanup pass into the cumulative
+// retention counters. Nil-tolerant.
+func (m *Metrics) ObserveRetentionSweep(res RetentionSweepResult) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.retentionExpiredTotal += uint64(res.Expired)
+	m.retentionDeletedTotal += uint64(res.Deleted)
+	m.retentionDeleteErrTotal += uint64(res.DeleteErrs)
+	m.retentionBytesFreed += res.BytesFreed
 }
 
 // ObserveAdmin records one admin response with the given HTTP status code.
@@ -266,10 +421,29 @@ func (m *Metrics) writeText(w io.Writer) {
 	for k, v := range m.roomAdmission {
 		roomAdm[k] = v
 	}
+	parts := make(map[roomKey]int, len(m.participantsInRoom))
+	for k, v := range m.participantsInRoom {
+		parts[k] = v
+	}
+	egLife := make(map[string]uint64, len(m.egressLifecycle))
+	for k, v := range m.egressLifecycle {
+		egLife[k] = v
+	}
+	recLife := make(map[string]uint64, len(m.recordingLifecycle))
+	for k, v := range m.recordingLifecycle {
+		recLife[k] = v
+	}
 	maxParticipants := m.maxParticipants
 	maxRooms := m.maxRooms
 	totalRooms := m.totalRooms
 	roomsAtCapacity := m.roomsAtCapacity
+	egressInProgress := m.egressInProgress
+	recBytes := m.recordingBytesTotal
+	recDurationMs := m.recordingDurationMsTotal
+	retExpired := m.retentionExpiredTotal
+	retDeleted := m.retentionDeletedTotal
+	retDeleteErr := m.retentionDeleteErrTotal
+	retBytesFreed := m.retentionBytesFreed
 	m.mu.Unlock()
 
 	// admin_requests_total
@@ -350,6 +524,80 @@ func (m *Metrics) writeText(w io.Writer) {
 	_, _ = io.WriteString(w, "# HELP vulos_meet_rooms_at_capacity 1 when the box has reached its configured max_rooms ceiling, else 0.\n")
 	_, _ = io.WriteString(w, "# TYPE vulos_meet_rooms_at_capacity gauge\n")
 	fmt.Fprintf(w, "vulos_meet_rooms_at_capacity %d\n", roomsAtCapacity)
+
+	// participants_in_room (gauge, tenant+room-labelled) — current participant
+	// count per room, refreshed on admin list. Bounded by MaxRooms.
+	_, _ = io.WriteString(w, "# HELP vulos_meet_participants_in_room Current participant count per room, refreshed on admin list.\n")
+	_, _ = io.WriteString(w, "# TYPE vulos_meet_participants_in_room gauge\n")
+	pkeys := make([]roomKey, 0, len(parts))
+	for k := range parts {
+		pkeys = append(pkeys, k)
+	}
+	sort.Slice(pkeys, func(i, j int) bool {
+		if pkeys[i].tenant != pkeys[j].tenant {
+			return pkeys[i].tenant < pkeys[j].tenant
+		}
+		return pkeys[i].room < pkeys[j].room
+	})
+	for _, k := range pkeys {
+		fmt.Fprintf(w, "vulos_meet_participants_in_room{tenant=%q,room=%q} %d\n", escapeLabel(k.tenant), escapeLabel(k.room), parts[k])
+	}
+
+	// egress_lifecycle_total (counter, event-labelled) — egress JOB outcomes,
+	// distinct from egress_requests_total which counts proxy requests.
+	_, _ = io.WriteString(w, "# HELP vulos_meet_egress_lifecycle_total Count of egress job lifecycle transitions by event (started/completed/failed).\n")
+	_, _ = io.WriteString(w, "# TYPE vulos_meet_egress_lifecycle_total counter\n")
+	elKeys := make([]string, 0, len(egLife))
+	for k := range egLife {
+		elKeys = append(elKeys, k)
+	}
+	sort.Strings(elKeys)
+	for _, k := range elKeys {
+		fmt.Fprintf(w, "vulos_meet_egress_lifecycle_total{event=%q} %d\n", k, egLife[k])
+	}
+
+	_, _ = io.WriteString(w, "# HELP vulos_meet_egress_in_progress Egress jobs currently in progress (started minus completed/failed).\n")
+	_, _ = io.WriteString(w, "# TYPE vulos_meet_egress_in_progress gauge\n")
+	fmt.Fprintf(w, "vulos_meet_egress_in_progress %d\n", egressInProgress)
+
+	// recording_lifecycle_total (counter, state-labelled) — recording-ledger
+	// state transitions across the receiver + retention driver.
+	_, _ = io.WriteString(w, "# HELP vulos_meet_recording_lifecycle_total Count of recording-ledger state transitions by state.\n")
+	_, _ = io.WriteString(w, "# TYPE vulos_meet_recording_lifecycle_total counter\n")
+	rlKeys := make([]string, 0, len(recLife))
+	for k := range recLife {
+		rlKeys = append(rlKeys, k)
+	}
+	sort.Strings(rlKeys)
+	for _, k := range rlKeys {
+		fmt.Fprintf(w, "vulos_meet_recording_lifecycle_total{state=%q} %d\n", k, recLife[k])
+	}
+
+	// Recording byte/duration accounting (counters).
+	_, _ = io.WriteString(w, "# HELP vulos_meet_recording_bytes_total Cumulative bytes of finalised (available) recordings observed.\n")
+	_, _ = io.WriteString(w, "# TYPE vulos_meet_recording_bytes_total counter\n")
+	fmt.Fprintf(w, "vulos_meet_recording_bytes_total %d\n", recBytes)
+
+	_, _ = io.WriteString(w, "# HELP vulos_meet_recording_duration_ms_total Cumulative duration (ms) of finalised (available) recordings observed.\n")
+	_, _ = io.WriteString(w, "# TYPE vulos_meet_recording_duration_ms_total counter\n")
+	fmt.Fprintf(w, "vulos_meet_recording_duration_ms_total %d\n", recDurationMs)
+
+	// Retention sweep accounting (counters).
+	_, _ = io.WriteString(w, "# HELP vulos_meet_retention_expired_total Cumulative recordings marked expired by the retention sweep.\n")
+	_, _ = io.WriteString(w, "# TYPE vulos_meet_retention_expired_total counter\n")
+	fmt.Fprintf(w, "vulos_meet_retention_expired_total %d\n", retExpired)
+
+	_, _ = io.WriteString(w, "# HELP vulos_meet_retention_deleted_total Cumulative recordings whose blob delete was confirmed by the retention sweep.\n")
+	_, _ = io.WriteString(w, "# TYPE vulos_meet_retention_deleted_total counter\n")
+	fmt.Fprintf(w, "vulos_meet_retention_deleted_total %d\n", retDeleted)
+
+	_, _ = io.WriteString(w, "# HELP vulos_meet_retention_delete_errors_total Cumulative blob-delete failures (left expired for retry) during retention sweeps.\n")
+	_, _ = io.WriteString(w, "# TYPE vulos_meet_retention_delete_errors_total counter\n")
+	fmt.Fprintf(w, "vulos_meet_retention_delete_errors_total %d\n", retDeleteErr)
+
+	_, _ = io.WriteString(w, "# HELP vulos_meet_retention_bytes_freed_total Cumulative bytes freed by confirmed retention deletions.\n")
+	_, _ = io.WriteString(w, "# TYPE vulos_meet_retention_bytes_freed_total counter\n")
+	fmt.Fprintf(w, "vulos_meet_retention_bytes_freed_total %d\n", retBytesFreed)
 }
 
 // escapeLabel applies the Prometheus exposition-format escapes required for

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -51,6 +52,18 @@ func PingClusterRedis(ctx context.Context, cfg *Config) error {
 		}
 		if line, err := br.ReadString('\n'); err != nil || !strings.HasPrefix(line, "+OK") {
 			return fmt.Errorf("%w: auth rejected (line=%q err=%v)", ErrClusterRedisUnreachable, line, err)
+		}
+	}
+	// SELECT the same DB the rendered LiveKit cluster block uses, so the
+	// self-check verifies reachability of the EXACT keyspace LiveKit will use
+	// for node discovery — not just db 0. A misconfigured/forbidden DB index
+	// then fails fast at boot instead of surfacing as a discovery no-op later.
+	if db := cfg.Cluster.Redis.DB; db != 0 {
+		if _, err := writeRedisCmd(conn, "SELECT", strconv.Itoa(db)); err != nil {
+			return fmt.Errorf("%w: select write: %v", ErrClusterRedisUnreachable, err)
+		}
+		if line, err := br.ReadString('\n'); err != nil || !strings.HasPrefix(line, "+OK") {
+			return fmt.Errorf("%w: select db %d rejected (line=%q err=%v)", ErrClusterRedisUnreachable, db, line, err)
 		}
 	}
 	if _, err := writeRedisCmd(conn, "PING"); err != nil {

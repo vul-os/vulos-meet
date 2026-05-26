@@ -197,7 +197,40 @@ func (s *AdminServer) handleListRooms(w http.ResponseWriter, r *http.Request, te
 	// for the per-box ceiling — all with no extra LiveKit RPCs.
 	s.metrics.SetActiveRooms(tenant, len(short))
 	s.metrics.SetTotalRooms(len(all))
+	// Per-room participant gauge: only if the room service can report counts
+	// (LiveKit client does; the in-memory fake does). Refresh this tenant's
+	// rooms each list so closed rooms drop out of the gauge.
+	s.refreshParticipantGauges(ctx, tenant)
 	writeJSON(w, http.StatusOK, listRoomsResponse{Tenant: tenant, Rooms: short})
+}
+
+// refreshParticipantGauges repopulates vulos_meet_participants_in_room for one
+// tenant if the room service supports participant counts. Best-effort: a
+// listing error leaves the previous gauge values in place rather than failing
+// the admin response (the room list already succeeded). Bounded to the calling
+// tenant's rooms so the metrics layer never sees cross-tenant room names.
+func (s *AdminServer) refreshParticipantGauges(ctx context.Context, tenant string) {
+	if s.metrics == nil {
+		return
+	}
+	lister, ok := s.rooms.(RoomParticipantLister)
+	if !ok {
+		return
+	}
+	rps, err := lister.ListRoomParticipants(ctx)
+	if err != nil {
+		return
+	}
+	s.metrics.ResetParticipantsForTenant(tenant)
+	sep := s.tenant.Separator()
+	prefix := tenant + sep
+	for _, rp := range rps {
+		if !strings.HasPrefix(rp.Name, prefix) {
+			continue // not this tenant's room
+		}
+		short := strings.TrimPrefix(rp.Name, prefix)
+		s.metrics.SetParticipantsInRoom(tenant, short, rp.NumParticipants)
+	}
 }
 
 func (s *AdminServer) handleDeleteRoom(w http.ResponseWriter, r *http.Request, tenant string) {

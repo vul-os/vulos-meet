@@ -52,6 +52,18 @@ type EgressReceiverConfig struct {
 	// BaseBackoff is the initial retry backoff. Defaults to 250ms;
 	// doubles each retry up to MaxAttempts.
 	BaseBackoff time.Duration
+
+	// Store is the recording lifecycle ledger (MEET-RECORDING-RETENTION-06).
+	// When set, the receiver advances each egress's lifecycle state from the
+	// webhook event (started → recording, ended/complete → available, failed →
+	// failed) so the retention driver has something to sweep. Nil disables
+	// ledger tracking (the receiver still verifies + forwards). The blob bytes
+	// remain owned by the cloud sink — the ledger is metadata only.
+	Store RecordingStore
+
+	// Metrics, when set, receives per-egress lifecycle counters/gauges as the
+	// receiver advances recordings. Optional; nil disables emission.
+	Metrics *Metrics
 }
 
 // EgressReceiver is the LiveKit egress webhook receiver. It verifies the
@@ -73,6 +85,8 @@ type EgressReceiver struct {
 	cfg     EgressReceiverConfig
 	keyProv auth.KeyProvider
 	httpc   *http.Client
+	store   RecordingStore // optional lifecycle ledger
+	metrics *Metrics       // optional
 }
 
 // NewEgressReceiver constructs a receiver. CloudURL may be empty (drops
@@ -97,6 +111,8 @@ func NewEgressReceiver(cfg EgressReceiverConfig) (*EgressReceiver, error) {
 		cfg:     cfg,
 		keyProv: auth.NewSimpleKeyProvider(cfg.APIKey, cfg.APISecret),
 		httpc:   cfg.HTTPClient,
+		store:   cfg.Store,
+		metrics: cfg.Metrics,
 	}, nil
 }
 
@@ -139,12 +155,17 @@ func (r *EgressReceiver) handle(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
-	envelope, err := r.envelopeFromWebhookBody(raw)
+	envelope, parsed, err := r.envelopeFromWebhookBody(raw)
 	if err != nil {
 		// Body verified OK but content was unusable. Return 400 not 500.
 		http.Error(w, "bad event", http.StatusBadRequest)
 		return
 	}
+	// Advance the lifecycle ledger BEFORE forwarding. The ledger is local
+	// metadata; even if the cloud forward later fails (and LiveKit redelivers),
+	// recording the state we just verified is correct and idempotent. The blob
+	// itself stays owned by the cloud sink — we track state, not bytes.
+	r.recordLifecycle(req.Context(), envelope, parsed)
 	if r.cfg.CloudURL == "" {
 		// Verified + parsed; nothing to forward. Self-host mode is a
 		// supported deployment shape — accept and ack.
@@ -165,9 +186,11 @@ func (r *EgressReceiver) handle(w http.ResponseWriter, req *http.Request) {
 // Vulos-shaped envelope. The body is JSON because LiveKit's webhook
 // notifier emits JSON over the wire (the protobuf is only the in-memory
 // representation).
-func (r *EgressReceiver) envelopeFromWebhookBody(raw []byte) (*VulosEgressEnvelope, error) {
+func (r *EgressReceiver) envelopeFromWebhookBody(raw []byte) (*VulosEgressEnvelope, *parsedEgress, error) {
 	// Minimal struct mirroring the fields we care about; lets us avoid
-	// pulling in proto-json unmarshalling.
+	// pulling in proto-json unmarshalling. We additionally read the egress
+	// status + file results so the lifecycle ledger can record size/duration
+	// and the available/failed terminal state.
 	var ev struct {
 		Event string `json:"event"`
 		Room  struct {
@@ -176,10 +199,19 @@ func (r *EgressReceiver) envelopeFromWebhookBody(raw []byte) (*VulosEgressEnvelo
 		EgressInfo struct {
 			EgressId string `json:"egress_id"`
 			RoomName string `json:"room_name"`
+			Status   string `json:"status"`
+			File     struct {
+				Size     json.Number `json:"size"`
+				Duration json.Number `json:"duration"`
+			} `json:"file"`
+			FileResults []struct {
+				Size     json.Number `json:"size"`
+				Duration json.Number `json:"duration"`
+			} `json:"file_results"`
 		} `json:"egress_info"`
 	}
 	if err := json.Unmarshal(raw, &ev); err != nil {
-		return nil, fmt.Errorf("vulos-meet: parse webhook body: %w", err)
+		return nil, nil, fmt.Errorf("vulos-meet: parse webhook body: %w", err)
 	}
 	// Egress events carry the room name on EgressInfo.RoomName; non-egress
 	// events use Room.Name. We accept either; the receiver is "any LiveKit
@@ -189,7 +221,7 @@ func (r *EgressReceiver) envelopeFromWebhookBody(raw []byte) (*VulosEgressEnvelo
 		fullRoom = ev.Room.Name
 	}
 	if fullRoom == "" {
-		return nil, errors.New("vulos-meet: webhook event has no room name")
+		return nil, nil, errors.New("vulos-meet: webhook event has no room name")
 	}
 	tenant, rest, err := r.cfg.Tenant.SplitRoom(fullRoom)
 	if err != nil {
@@ -197,7 +229,23 @@ func (r *EgressReceiver) envelopeFromWebhookBody(raw []byte) (*VulosEgressEnvelo
 		// the cross-tenant audit point: LiveKit was somehow tricked into
 		// emitting an event for a room that does not belong to any Vulos
 		// tenant, and we refuse to launder it to the cloud.
-		return nil, fmt.Errorf("vulos-meet: webhook room %q does not parse: %w", fullRoom, err)
+		return nil, nil, fmt.Errorf("vulos-meet: webhook room %q does not parse: %w", fullRoom, err)
+	}
+	pe := &parsedEgress{
+		event:    ev.Event,
+		status:   ev.EgressInfo.Status,
+		egressID: ev.EgressInfo.EgressId,
+	}
+	// Prefer the single file block; fall back to the first file_results entry
+	// (LiveKit emits file_results for room-composite egress). Sizes/durations
+	// are best-effort — a missing/zero value just leaves the ledger field 0.
+	pe.sizeBytes = parseUint(ev.EgressInfo.File.Size)
+	pe.durationMs = parseUint(ev.EgressInfo.File.Duration)
+	if pe.sizeBytes == 0 && len(ev.EgressInfo.FileResults) > 0 {
+		pe.sizeBytes = parseUint(ev.EgressInfo.FileResults[0].Size)
+	}
+	if pe.durationMs == 0 && len(ev.EgressInfo.FileResults) > 0 {
+		pe.durationMs = parseUint(ev.EgressInfo.FileResults[0].Duration)
 	}
 	return &VulosEgressEnvelope{
 		Schema:   "vulos-meet/egress/v1",
@@ -208,7 +256,99 @@ func (r *EgressReceiver) envelopeFromWebhookBody(raw []byte) (*VulosEgressEnvelo
 		EgressID: ev.EgressInfo.EgressId,
 		At:       time.Now().Unix(),
 		Raw:      json.RawMessage(raw),
-	}, nil
+	}, pe, nil
+}
+
+// parsedEgress carries the lifecycle-relevant fields extracted from a webhook
+// event (separate from the cloud-facing envelope, which is intentionally
+// narrow). It is only used to feed the local lifecycle ledger.
+type parsedEgress struct {
+	event      string
+	status     string
+	egressID   string
+	sizeBytes  uint64
+	durationMs uint64
+}
+
+// parseUint converts a json.Number (LiveKit serialises file sizes/durations as
+// numeric strings or numbers depending on the proto-json codec) to uint64,
+// returning 0 on any parse failure.
+func parseUint(n json.Number) uint64 {
+	if n == "" {
+		return 0
+	}
+	v, err := n.Int64()
+	if err != nil || v < 0 {
+		return 0
+	}
+	return uint64(v)
+}
+
+// recordLifecycle advances the recording ledger from one webhook event. It is
+// a no-op when no store is configured. Mapping:
+//
+//	egress_started                          → recording
+//	egress_ended / egress_updated(complete) → available (with size/duration)
+//	egress_updated(failed/aborted)          → failed
+//
+// LiveKit's egress status enum values are EGRESS_STARTING, EGRESS_ACTIVE,
+// EGRESS_ENDING, EGRESS_COMPLETE, EGRESS_FAILED, EGRESS_ABORTED, EGRESS_LIMIT_
+// REACHED. We map COMPLETE → available, FAILED/ABORTED → failed, and use the
+// event name as a fallback when status is absent.
+func (r *EgressReceiver) recordLifecycle(ctx context.Context, env *VulosEgressEnvelope, pe *parsedEgress) {
+	if r.store == nil || pe == nil || pe.egressID == "" {
+		return
+	}
+	now := time.Now().Unix()
+	rec := Recording{
+		EgressID: pe.egressID,
+		Tenant:   env.Tenant,
+		Room:     env.Room,
+	}
+	switch {
+	case statusIsComplete(pe.status):
+		rec.State = RecordingStateAvailable
+		rec.EndedAt = now
+		rec.SizeBytes = pe.sizeBytes
+		rec.DurationMs = pe.durationMs
+	case statusIsFailed(pe.status):
+		rec.State = RecordingStateFailed
+		rec.EndedAt = now
+	case pe.event == "egress_ended":
+		rec.State = RecordingStateAvailable
+		rec.EndedAt = now
+		rec.SizeBytes = pe.sizeBytes
+		rec.DurationMs = pe.durationMs
+	case pe.event == "egress_started":
+		rec.State = RecordingStateRecording
+		rec.StartedAt = now
+	default:
+		// Some intermediate egress_updated (active/ending) — record presence
+		// but don't force a state we can't justify. Use recording as the
+		// floor; Upsert won't regress a later available/failed.
+		rec.State = RecordingStateRecording
+		rec.StartedAt = now
+	}
+	if err := r.store.Upsert(ctx, rec); err == nil {
+		r.metrics.ObserveRecordingLifecycle(rec.State)
+		if rec.State == RecordingStateAvailable && (rec.SizeBytes > 0 || rec.DurationMs > 0) {
+			r.metrics.ObserveRecordingBytes(rec.SizeBytes, rec.DurationMs)
+		}
+	}
+}
+
+// statusIsComplete / statusIsFailed classify a LiveKit egress status string.
+func statusIsComplete(s string) bool {
+	return s == "EGRESS_COMPLETE"
+}
+
+func statusIsFailed(s string) bool {
+	switch s {
+	case "EGRESS_FAILED", "EGRESS_ABORTED", "EGRESS_LIMIT_REACHED":
+		return true
+	default:
+		return false
+	}
 }
 
 // forward POSTs the envelope to the cloud with bounded exponential-backoff

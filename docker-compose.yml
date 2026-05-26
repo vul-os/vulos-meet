@@ -1,0 +1,84 @@
+# docker-compose.yml — Vulos Meet cascading-SFU stack (MEET-CASCADE-REDIS-07)
+#
+# WHY THIS FILE EXISTS:
+#   Cascading SFU (media.cascading_sfu) needs Redis for LiveKit node discovery
+#   (peer SFUs find each other and route a participant's tracks across nodes).
+#   Before this artifact, the Redis was "operator-stands-it-up-somehow" — the
+#   wrap pinged it (cluster.go PingClusterRedis) but nothing PROVISIONED it.
+#   This compose file is that provisioning artifact: it brings up a Redis that
+#   `cluster.redis.addr` actually points at, plus a vulos-meet instance wired to
+#   it. `docker compose up` gives you a working single-box cascading-ready stack;
+#   scale `meet` to multiple nodes (all sharing one Redis + cluster_id) to get a
+#   real cascade.
+#
+# QUICKSTART (self-host / dev):
+#   export MEET_LIVEKIT_API_KEY=APItestkey
+#   export MEET_LIVEKIT_API_SECRET=supersecretsigningvalueof32bytes
+#   export MEET_ADMIN_TOKEN=change-me
+#   export MEET_CLUSTER_REDIS_PASSWORD=change-me-too
+#   docker compose up --build
+#
+# The meet service's docker-entrypoint.sh renders config.yaml from env, including
+# the cluster.redis block when MEET_CLUSTER_REDIS_ADDR is set (it is, below). The
+# wrap then PINGs Redis at boot (fail-fast) and renders the LiveKit cluster block.
+#
+# PROD NOTE: on Fly, use fly-redis.toml (a dedicated Upstash/Fly Redis app) and
+# set MEET_CLUSTER_REDIS_ADDR to that app's .internal address — see that file +
+# README "Cascading SFU: provisioning Redis".
+
+services:
+  # ── Redis: LiveKit cascading-SFU node-discovery store ──────────────────────
+  # A single instance is sufficient — LiveKit does not require Redis cluster
+  # mode for SFU discovery, only a shared keyspace. Password-protected so the
+  # discovery keyspace is not world-writable on a shared network.
+  redis:
+    image: redis:7-alpine
+    # requirepass binds the same secret the wrap AUTHs with (applyEnv reads
+    # MEET_CLUSTER_REDIS_PASSWORD; the wrap sends AUTH before PING).
+    command: ["redis-server", "--requirepass", "${MEET_CLUSTER_REDIS_PASSWORD:?set MEET_CLUSTER_REDIS_PASSWORD}", "--save", "", "--appendonly", "no"]
+    # Discovery state is ephemeral (nodes re-register on reconnect), so no
+    # persistence is needed — keep it in-memory for speed and simplicity.
+    healthcheck:
+      # The healthcheck PINGs with the password so compose only marks Redis
+      # healthy once it actually answers authenticated commands — mirroring
+      # what the wrap's self-check does at boot.
+      test: ["CMD", "redis-cli", "-a", "${MEET_CLUSTER_REDIS_PASSWORD}", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    networks: [meet]
+
+  # ── vulos-meet: the SFU wrapper + supervised livekit-server ────────────────
+  meet:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      redis:
+        condition: service_healthy   # don't boot meet until Redis answers AUTH+PING
+    environment:
+      # Shared LiveKit key/secret (MUST match vulos-cloud MEET-CP-01 in prod).
+      MEET_LIVEKIT_API_KEY: "${MEET_LIVEKIT_API_KEY:?set MEET_LIVEKIT_API_KEY}"
+      MEET_LIVEKIT_API_SECRET: "${MEET_LIVEKIT_API_SECRET:?set MEET_LIVEKIT_API_SECRET}"
+      MEET_REGION: "${MEET_REGION:-local-dev}"
+      MEET_ADMIN_TOKEN: "${MEET_ADMIN_TOKEN:?set MEET_ADMIN_TOKEN}"
+      MEET_SIGNAL_ADDR: "0.0.0.0:7883"
+      # THE PROVISIONING WIRE-UP: point cluster.redis.addr at the redis service
+      # above. The entrypoint renders this into config.yaml's cluster.redis.addr,
+      # so cascading_sfu (default-on) actually has a reachable, provisioned Redis
+      # instead of a pinged-but-unprovisioned target.
+      MEET_CLUSTER_REDIS_ADDR: "redis:6379"
+      MEET_CLUSTER_REDIS_PASSWORD: "${MEET_CLUSTER_REDIS_PASSWORD}"
+      # Optional cloud recording hook (leave unset for self-host).
+      MEET_EGRESS_ENDPOINT: "${MEET_EGRESS_ENDPOINT:-}"
+    ports:
+      - "7883:7883"            # public signal-gate (WSS /rtc + egress Twirp)
+      # UDP media range — keep it narrow in dev. Prod uses the single-port mux.
+      - "50000-50050:50000-50050/udp"
+    restart: unless-stopped
+    networks: [meet]
+
+networks:
+  meet:
+    driver: bridge

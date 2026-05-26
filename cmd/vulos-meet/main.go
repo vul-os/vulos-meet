@@ -131,18 +131,48 @@ func run(configPath, adminAddrOverride, metricsAddrOverride string) error {
 	}
 	egressProxy.SetMetrics(metrics)
 
+	// Recording lifecycle ledger (MEET-RECORDING-RETENTION-06). The blob bytes
+	// live in the cloud sink; this is the local state machine + retention
+	// driver. The egress receiver advances each egress's lifecycle from the
+	// webhook event; the driver sweeps past-retention recordings and dispatches
+	// the actual blob delete through a seam.
+	recStore := wrap.NewMemRecordingStore()
+	recCloudTok := os.Getenv("MEET_RECORDING_CLOUD_TOKEN")
+
 	// Egress webhook receiver: forwards LiveKit egress events to the cloud
-	// (MEET-RECORDING-01) after verifying the LiveKit signature.
+	// (MEET-RECORDING-01) after verifying the LiveKit signature, and advances
+	// the local recording lifecycle ledger.
 	egressRx, err := wrap.NewEgressReceiver(wrap.EgressReceiverConfig{
 		Tenant:       tenant,
 		APIKey:       cfg.LiveKit.APIKey,
 		APISecret:    cfg.LiveKit.APISecret,
 		CloudURL:     cfg.Recording.EgressEndpoint,
-		CloudAuthTok: os.Getenv("MEET_RECORDING_CLOUD_TOKEN"),
+		CloudAuthTok: recCloudTok,
+		Store:        recStore,
+		Metrics:      metrics,
 	})
 	if err != nil {
 		return err
 	}
+
+	// Retention cleanup driver. The blob deleter is the genuinely-external seam:
+	// when recording.cloud_delete_base_url is set, deletions are dispatched to
+	// the vulos-cloud MEET-RECORDING-01 sink (the blob owner); otherwise the
+	// box runs self-host (no central blob — the no-op deleter advances the
+	// ledger). The sweep loop only runs when a retention rule is configured.
+	var blobDeleter wrap.RecordingBlobDeleter
+	if cfg.Recording.CloudDeleteBaseURL != "" {
+		cd, err := wrap.NewCloudBlobDeleter(cfg.Recording.CloudDeleteBaseURL, recCloudTok, nil)
+		if err != nil {
+			return err
+		}
+		blobDeleter = cd
+	}
+	retentionDriver, err := wrap.NewRetentionDriver(recStore, cfg.RetentionPolicy(), blobDeleter)
+	if err != nil {
+		return err
+	}
+	retentionDriver.SetMetrics(metrics)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -196,6 +226,18 @@ func run(configPath, adminAddrOverride, metricsAddrOverride string) error {
 			errCh <- fmt.Errorf("signal-gate server: %w", err)
 		}
 	}()
+
+	// Recording retention sweeper. Runs only when a retention rule is set
+	// (RetentionSweepInterval() returns 0 otherwise, and RunLoop is a no-op).
+	if iv := cfg.RetentionSweepInterval(); iv > 0 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			log.Printf("vulos-meet: recording retention sweeper every %s (ttl=%s max_per_room=%d max_per_tenant=%d cloud_delete=%t)",
+				iv, cfg.Recording.RetentionTTL, cfg.Recording.RetentionMaxPerRoom, cfg.Recording.RetentionMaxPerTenant, cfg.Recording.CloudDeleteBaseURL != "")
+			retentionDriver.RunLoop(ctx, iv)
+		}()
+	}
 
 	// LiveKit Server child process.
 	lkConfigPath := filepath.Join(os.TempDir(), "vulos-meet-livekit.yaml")

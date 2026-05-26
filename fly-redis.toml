@@ -1,0 +1,60 @@
+# fly-redis.toml — dedicated Redis for Vulos Meet cascading-SFU discovery
+# (MEET-CASCADE-REDIS-07, production provisioning artifact).
+#
+# WHY A SEPARATE FLY APP:
+#   Cascading SFU needs ONE Redis shared by every vulos-meet box in a region so
+#   the SFU nodes discover each other (cluster_id is the box region; see
+#   internal/wrap/cluster.go renderClusterBlock). The SFU boxes themselves are
+#   stateless and per-region (vulos-meet-<region>); the discovery Redis is the
+#   one piece of shared state. Running it as its own Fly app (one per region)
+#   keeps it off the SFU boxes (which restart on every binary bump) and lets the
+#   meet boxes reach it over the Fly 6PN private network by .internal DNS.
+#
+# PROVISION (per region — match the meet box region):
+#   fly launch --no-deploy --name vulos-meet-redis-<region> --region <region> --copy-config --config fly-redis.toml
+#   fly secrets set REDIS_PASSWORD=<strong-secret> -a vulos-meet-redis-<region>
+#   fly volumes create redis_data --size 1 -a vulos-meet-redis-<region> --region <region>
+#   fly deploy -a vulos-meet-redis-<region> --config fly-redis.toml
+#
+# WIRE THE MEET BOXES TO IT (the actual provisioning hand-off):
+#   On each vulos-meet-<region> app, set:
+#     fly secrets set MEET_CLUSTER_REDIS_ADDR=vulos-meet-redis-<region>.internal:6379 -a vulos-meet-<region>
+#     fly secrets set MEET_CLUSTER_REDIS_PASSWORD=<same-secret>                        -a vulos-meet-<region>
+#   docker-entrypoint.sh renders MEET_CLUSTER_REDIS_ADDR into config.yaml's
+#   cluster.redis.addr, and the wrap (applyEnv) reads MEET_CLUSTER_REDIS_PASSWORD.
+#   At boot the wrap AUTHs + PINGs this Redis (cluster.go) and fails fast if it
+#   is unreachable — so a missing/misconfigured Redis never yields a half-up SFU.
+#
+# Alternative: Upstash Redis on Fly (`fly redis create`) — set
+# MEET_CLUSTER_REDIS_ADDR to the Upstash endpoint and the password to its token.
+# This file is the self-managed option (cheaper, in-region, full control).
+
+app            = "vulos-meet-redis"   # rename per region: vulos-meet-redis-<region>
+primary_region = "PLACEHOLDER"        # MUST equal the meet box's region
+
+[build]
+  image = "redis:7-alpine"
+
+# Redis listens on 6379 over the 6PN private network ONLY. There is no
+# [http_service] / public service block: this Redis is reachable solely by the
+# region's vulos-meet boxes via <app>.internal — never from the public edge.
+[[services]]
+  internal_port = 6379
+  protocol      = "tcp"
+  # No [[services.ports]] handlers → not published to a public IP. Private 6PN
+  # peers (the meet boxes) reach internal_port directly by .internal DNS.
+
+# requirepass is fed from the REDIS_PASSWORD secret. --save "" / --appendonly no:
+# discovery state is ephemeral (nodes re-register on reconnect) so we don't pay
+# for persistence; the volume below exists only so a restart keeps the same
+# dataset dir without compose churn. Drop the mount if you want pure in-memory.
+[experimental]
+  cmd = ["redis-server", "--requirepass", "$REDIS_PASSWORD", "--save", "", "--appendonly", "no", "--bind", "0.0.0.0"]
+
+[[mounts]]
+  source      = "redis_data"
+  destination = "/data"
+
+[[vm]]
+  size   = "shared-cpu-1x"
+  memory = "256mb"   # SFU discovery keyspace is tiny; 256mb is ample

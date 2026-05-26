@@ -130,6 +130,75 @@ func TestConfig_EnvOverridesAdminToken(t *testing.T) {
 	}
 }
 
+func TestConfig_ParsesRetentionPolicy(t *testing.T) {
+	_ = os.Unsetenv(AdminTokenEnv)
+	cfg := `
+region: za-jhb
+livekit:
+  api_key: APItestkey
+  api_secret: supersecretsigningvalueof32bytes
+admin:
+  token: tok
+recording:
+  egress_endpoint: https://meet-egress.vulos.example/v1/webhook
+  retention_ttl: 720h
+  retention_max_per_room: 10
+  retention_max_per_tenant: 100
+  retention_sweep_interval: 30m
+  cloud_delete_base_url: https://meet-egress.vulos.example
+`
+	c, err := ParseConfig([]byte(cfg))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	pol := c.RetentionPolicy()
+	if !pol.Enabled() {
+		t.Fatalf("policy should be enabled")
+	}
+	if pol.TTL.Hours() != 720 || pol.MaxPerRoom != 10 || pol.MaxPerTenant != 100 {
+		t.Fatalf("retention policy wrong: %+v", pol)
+	}
+	if c.RetentionSweepInterval() != 30*60*1e9 { // 30m in ns
+		t.Fatalf("sweep interval: %v", c.RetentionSweepInterval())
+	}
+	if c.Recording.CloudDeleteBaseURL == "" {
+		t.Fatalf("cloud delete base url not parsed")
+	}
+}
+
+func TestConfig_RetentionSweepDefaultsWhenRuleSet(t *testing.T) {
+	_ = os.Unsetenv(AdminTokenEnv)
+	cfg := `
+region: za-jhb
+livekit:
+  api_key: APItestkey
+  api_secret: supersecretsigningvalueof32bytes
+admin:
+  token: tok
+recording:
+  retention_ttl: 24h
+`
+	c, err := ParseConfig([]byte(cfg))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if c.RetentionSweepInterval() != DefaultRetentionSweepInterval {
+		t.Fatalf("expected default sweep interval, got %v", c.RetentionSweepInterval())
+	}
+	// No retention rule → sweeper disabled (interval 0).
+	c2, _ := ParseConfig([]byte(`
+region: za-jhb
+livekit:
+  api_key: APItestkey
+  api_secret: supersecretsigningvalueof32bytes
+admin:
+  token: tok
+`))
+	if c2.RetentionSweepInterval() != 0 {
+		t.Fatalf("no rule → sweeper must be disabled, got %v", c2.RetentionSweepInterval())
+	}
+}
+
 func TestLoadConfig_RequiresPath(t *testing.T) {
 	if _, err := LoadConfig(""); err == nil {
 		t.Fatalf("expected error with empty path")

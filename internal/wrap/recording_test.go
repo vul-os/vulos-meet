@@ -306,5 +306,75 @@ func TestEgress_NoCloudUrl_StillVerifies(t *testing.T) {
 	}
 }
 
+// TestEgress_AdvancesLifecycleLedger confirms the receiver records the egress
+// lifecycle into a RecordingStore as webhook events arrive: started → recording,
+// then complete → available with the file size/duration.
+func TestEgress_AdvancesLifecycleLedger(t *testing.T) {
+	store := NewMemRecordingStore()
+	rx, err := NewEgressReceiver(EgressReceiverConfig{
+		Tenant:    NewTenant(""),
+		APIKey:    testAPIKey,
+		APISecret: testAPISecret,
+		Store:     store,
+	})
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	srv := httptest.NewServer(rx.Handler())
+	defer srv.Close()
+
+	post := func(body []byte) {
+		tok := signLiveKitWebhook(t, body)
+		req, _ := http.NewRequest("POST", srv.URL+WebhookPath, bytes.NewReader(body))
+		req.Header.Set("Authorization", tok)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("post: %v", err)
+		}
+		resp.Body.Close()
+	}
+
+	// egress_started → recording state.
+	post([]byte(`{"event":"egress_started","egress_info":{"egress_id":"EG_L","room_name":"acme:standup","status":"EGRESS_ACTIVE"}}`))
+	recs, _ := store.List(context.Background())
+	if len(recs) != 1 || recs[0].State != RecordingStateRecording {
+		t.Fatalf("after start expected 1 recording-state entry, got %+v", recs)
+	}
+
+	// egress_ended with EGRESS_COMPLETE + a file result → available + size/dur.
+	post([]byte(`{"event":"egress_ended","egress_info":{"egress_id":"EG_L","room_name":"acme:standup","status":"EGRESS_COMPLETE","file":{"size":2048,"duration":600000}}}`))
+	recs, _ = store.List(context.Background())
+	if recs[0].State != RecordingStateAvailable {
+		t.Fatalf("after complete expected available, got %q", recs[0].State)
+	}
+	if recs[0].SizeBytes != 2048 || recs[0].DurationMs != 600000 {
+		t.Fatalf("size/duration not recorded: %+v", recs[0])
+	}
+	if recs[0].Tenant != "acme" || recs[0].Room != "standup" {
+		t.Fatalf("tenant/room not recorded: %+v", recs[0])
+	}
+}
+
+func TestEgress_LifecycleFailedStatus(t *testing.T) {
+	store := NewMemRecordingStore()
+	rx, _ := NewEgressReceiver(EgressReceiverConfig{
+		Tenant: NewTenant(""), APIKey: testAPIKey, APISecret: testAPISecret, Store: store,
+	})
+	srv := httptest.NewServer(rx.Handler())
+	defer srv.Close()
+
+	body := []byte(`{"event":"egress_updated","egress_info":{"egress_id":"EG_F","room_name":"acme:standup","status":"EGRESS_FAILED"}}`)
+	tok := signLiveKitWebhook(t, body)
+	req, _ := http.NewRequest("POST", srv.URL+WebhookPath, bytes.NewReader(body))
+	req.Header.Set("Authorization", tok)
+	resp, _ := http.DefaultClient.Do(req)
+	resp.Body.Close()
+
+	recs, _ := store.List(context.Background())
+	if len(recs) != 1 || recs[0].State != RecordingStateFailed {
+		t.Fatalf("expected failed state, got %+v", recs)
+	}
+}
+
 // Avoid unused-context warning when go vet is run during the run.
 var _ = context.Background

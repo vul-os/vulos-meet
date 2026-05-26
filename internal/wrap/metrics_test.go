@@ -222,6 +222,105 @@ func TestMetrics_ValidatorObservesOutcomes(t *testing.T) {
 	}
 }
 
+func TestMetrics_RecordingAndEgressLifecycleExposed(t *testing.T) {
+	m := NewMetrics()
+	// Per-room participant gauges.
+	m.SetParticipantsInRoom("acme", "standup", 7)
+	m.SetParticipantsInRoom("acme", "retro", 0) // 0 → removed, must not appear
+	m.SetParticipantsInRoom("globex", "all-hands", 3)
+
+	// Recording lifecycle: one started, one available (mirrors to egress
+	// lifecycle started/completed + in-progress gauge), one failed.
+	m.ObserveRecordingLifecycle(RecordingStateRecording) // started, in-progress=1
+	m.ObserveRecordingLifecycle(RecordingStateAvailable) // completed, in-progress=0
+	m.ObserveRecordingLifecycle(RecordingStateRecording) // started, in-progress=1
+	m.ObserveRecordingLifecycle(RecordingStateFailed)    // failed, in-progress=0
+	m.ObserveRecordingBytes(2048, 600000)
+
+	// A retention sweep result folds into the retention counters.
+	m.ObserveRetentionSweep(RetentionSweepResult{Expired: 2, Deleted: 1, DeleteErrs: 1, BytesFreed: 4096})
+	m.ObserveRecordingLifecycle(RecordingStateExpired)
+	m.ObserveRecordingLifecycle(RecordingStateDeleted)
+
+	rec := httptest.NewRecorder()
+	m.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	body := rec.Body.String()
+	for _, s := range []string{
+		`vulos_meet_participants_in_room{tenant="acme",room="standup"} 7`,
+		`vulos_meet_participants_in_room{tenant="globex",room="all-hands"} 3`,
+		`vulos_meet_egress_lifecycle_total{event="started"} 2`,
+		`vulos_meet_egress_lifecycle_total{event="completed"} 1`,
+		`vulos_meet_egress_lifecycle_total{event="failed"} 1`,
+		`vulos_meet_egress_in_progress 0`,
+		`vulos_meet_recording_lifecycle_total{state="recording"} 2`,
+		`vulos_meet_recording_lifecycle_total{state="available"} 1`,
+		`vulos_meet_recording_lifecycle_total{state="failed"} 1`,
+		`vulos_meet_recording_lifecycle_total{state="expired"} 1`,
+		`vulos_meet_recording_lifecycle_total{state="deleted"} 1`,
+		`vulos_meet_recording_bytes_total 2048`,
+		`vulos_meet_recording_duration_ms_total 600000`,
+		`vulos_meet_retention_expired_total 2`,
+		`vulos_meet_retention_deleted_total 1`,
+		`vulos_meet_retention_delete_errors_total 1`,
+		`vulos_meet_retention_bytes_freed_total 4096`,
+	} {
+		if !strings.Contains(body, s) {
+			t.Fatalf("missing %q in:\n%s", s, body)
+		}
+	}
+	// The zeroed room must NOT appear as a stale series.
+	if strings.Contains(body, `room="retro"`) {
+		t.Fatalf("a zero-participant room must be removed from the gauge:\n%s", body)
+	}
+}
+
+func TestMetrics_ParticipantGaugeFedByAdminList(t *testing.T) {
+	admin, rooms := newTestAdminServer(t)
+	m := NewMetrics()
+	admin.SetMetrics(m)
+
+	rooms.CreateRoom(context.Background(), "acme:standup")
+	rooms.SetParticipants("acme:standup", 5)
+	rooms.CreateRoom(context.Background(), "acme:retro")
+	rooms.SetParticipants("acme:retro", 2)
+	rooms.CreateRoom(context.Background(), "globex:secret") // other tenant — must not leak
+	rooms.SetParticipants("globex:secret", 9)
+
+	srv := httptest.NewServer(admin.Handler())
+	defer srv.Close()
+	req, _ := http.NewRequest("GET", srv.URL+"/admin/tenants/acme/rooms", nil)
+	req.Header.Set("Authorization", "Bearer supersecrettoken")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	resp.Body.Close()
+
+	rec := httptest.NewRecorder()
+	m.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	body := rec.Body.String()
+	if !strings.Contains(body, `vulos_meet_participants_in_room{tenant="acme",room="standup"} 5`) {
+		t.Fatalf("missing acme/standup participant gauge:\n%s", body)
+	}
+	if !strings.Contains(body, `vulos_meet_participants_in_room{tenant="acme",room="retro"} 2`) {
+		t.Fatalf("missing acme/retro participant gauge:\n%s", body)
+	}
+	// A list for tenant acme must NOT expose globex's rooms on the gauge.
+	if strings.Contains(body, "globex") {
+		t.Fatalf("cross-tenant room leaked into participant gauge:\n%s", body)
+	}
+}
+
+func TestMetrics_NilSafeNewCalls(t *testing.T) {
+	var m *Metrics
+	m.SetParticipantsInRoom("acme", "r", 1)
+	m.ResetParticipantsForTenant("acme")
+	m.ObserveEgressLifecycle(EgressLifecycleStarted)
+	m.ObserveRecordingLifecycle(RecordingStateAvailable)
+	m.ObserveRecordingBytes(1, 1)
+	m.ObserveRetentionSweep(RetentionSweepResult{})
+}
+
 // mintTokenWrongTenant produces a token whose `name` (tenant audience) does
 // not match the room prefix — the canonical replay-attempt shape
 // Validator.Validate must reject as ErrTokenWrongTenant.

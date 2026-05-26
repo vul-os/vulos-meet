@@ -164,6 +164,49 @@ func (l *LiveKitRoomService) ListRoomIDs(ctx context.Context) ([]string, error) 
 	return out, nil
 }
 
+// RoomParticipants is one room's name + current participant count, as reported
+// by LiveKit's ListRooms. It feeds the per-room participant gauge.
+type RoomParticipants struct {
+	Name            string
+	NumParticipants int
+}
+
+// RoomParticipantLister is the OPTIONAL richer listing seam: a RoomService that
+// can also report per-room participant counts. The admin handler type-asserts
+// for it to feed vulos_meet_participants_in_room; a RoomService that does not
+// implement it simply leaves that gauge unpopulated (the in-memory test fake
+// does implement it). Kept separate from RoomService so the core admin/delete
+// path's interface stays minimal.
+type RoomParticipantLister interface {
+	ListRoomParticipants(ctx context.Context) ([]RoomParticipants, error)
+}
+
+// ListRoomParticipants returns every room with its current participant count.
+// Single ListRooms RPC — LiveKit already carries NumParticipants on each Room.
+func (l *LiveKitRoomService) ListRoomParticipants(ctx context.Context) ([]RoomParticipants, error) {
+	l.requestsTotal.Add(1)
+	if err := l.preCall(); err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(ctx, l.cfg.CallTimeout)
+	defer cancel()
+	authCtx, err := l.authCtx(ctx, &auth.VideoGrant{RoomList: true})
+	if err != nil {
+		l.postCall(err)
+		return nil, err
+	}
+	resp, err := l.client.ListRooms(authCtx, &livekit.ListRoomsRequest{})
+	l.postCall(err)
+	if err != nil {
+		return nil, fmt.Errorf("vulos-meet: livekit ListRooms: %w", err)
+	}
+	out := make([]RoomParticipants, 0, len(resp.Rooms))
+	for _, r := range resp.Rooms {
+		out = append(out, RoomParticipants{Name: r.Name, NumParticipants: int(r.NumParticipants)})
+	}
+	return out, nil
+}
+
 // DeleteRoom removes a room. Returns nil on success regardless of whether
 // the room existed (LiveKit's RoomService semantics — idempotent delete).
 func (l *LiveKitRoomService) DeleteRoom(ctx context.Context, roomID string) error {

@@ -20,20 +20,44 @@ import (
 // RoomService interface.
 type MemoryRoomService struct {
 	mu    sync.Mutex
-	rooms map[string]struct{}
+	rooms map[string]int // roomID -> participant count
 }
 
 // NewMemoryRoomService constructs an empty in-memory room service.
 func NewMemoryRoomService() *MemoryRoomService {
-	return &MemoryRoomService{rooms: make(map[string]struct{})}
+	return &MemoryRoomService{rooms: make(map[string]int)}
 }
 
 // CreateRoom seeds a room ID. Used by tests + by the (eventual) "create
-// room on first join" upstream signal from LiveKit.
+// room on first join" upstream signal from LiveKit. The seeded room has a
+// participant count of 0 until SetParticipants records one.
 func (m *MemoryRoomService) CreateRoom(_ context.Context, roomID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.rooms[roomID] = struct{}{}
+	if _, ok := m.rooms[roomID]; !ok {
+		m.rooms[roomID] = 0
+	}
+}
+
+// SetParticipants sets a room's participant count (test/seed helper). Creating
+// the room if absent so a test can express "room R has N participants" in one
+// call.
+func (m *MemoryRoomService) SetParticipants(roomID string, n int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.rooms[roomID] = n
+}
+
+// ListRoomParticipants satisfies RoomParticipantLister so the admin surface can
+// feed the per-room participant gauge in tests without a live LiveKit child.
+func (m *MemoryRoomService) ListRoomParticipants(_ context.Context) ([]RoomParticipants, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]RoomParticipants, 0, len(m.rooms))
+	for r, n := range m.rooms {
+		out = append(out, RoomParticipants{Name: r, NumParticipants: n})
+	}
+	return out, nil
 }
 
 // ListRoomIDs returns every known room ID. The tenant gate is responsible

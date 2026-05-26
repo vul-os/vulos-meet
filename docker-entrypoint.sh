@@ -41,9 +41,17 @@ RTC_END="${MEET_RTC_PORT_END:-50200}"
     echo "  egress_endpoint: \"${MEET_EGRESS_ENDPOINT}\""
   fi
   if [ -n "${MEET_CLUSTER_REDIS_ADDR:-}" ]; then
+    # Cascading-SFU node-discovery Redis. PROVISION it with docker-compose.yml
+    # (the `redis` service) for self-host, or fly-redis.toml for Fly — both wire
+    # MEET_CLUSTER_REDIS_ADDR at this app. The password is read from env by the
+    # wrap (applyEnv), never written here. The optional DB index is rendered so
+    # the wrap's boot self-check PINGs the SAME keyspace LiveKit will use.
     echo "cluster:"
     echo "  redis:"
     echo "    addr: \"${MEET_CLUSTER_REDIS_ADDR}\""
+    if [ -n "${MEET_CLUSTER_REDIS_DB:-}" ]; then
+      echo "    db: ${MEET_CLUSTER_REDIS_DB}"
+    fi
   fi
 } > "${CONFIG_PATH}"
 

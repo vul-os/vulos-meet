@@ -183,6 +183,54 @@ front it. LiveKit stays Go/MIT-compatible either way.
 
 ---
 
+## Cascading SFU: provisioning Redis
+
+Cascading SFU (`media.cascading_sfu`, default-on) needs a Redis that LiveKit
+nodes use for peer discovery. `vulos-meet` PINGs it at boot (fail-fast) and
+renders the LiveKit cluster block, but Redis itself must be **provisioned**.
+Two artifacts do that:
+
+- **Self-host / dev — [`docker-compose.yml`](docker-compose.yml):** brings up a
+  password-protected `redis` service plus a `meet` instance wired to it
+  (`MEET_CLUSTER_REDIS_ADDR=redis:6379`). `meet` only boots once Redis answers
+  an authenticated `PING` (compose `depends_on: healthy`). Scale `meet` to
+  multiple nodes (all sharing one Redis + the region `cluster_id`) for a real
+  cascade.
+
+- **Fly / prod — [`fly-redis.toml`](fly-redis.toml):** a dedicated per-region
+  Redis Fly app reachable only over the 6PN private network by `.internal` DNS.
+  Wire the meet boxes with
+  `fly secrets set MEET_CLUSTER_REDIS_ADDR=vulos-meet-redis-<region>.internal:6379`
+  (+ `MEET_CLUSTER_REDIS_PASSWORD`). The SFU boxes stay stateless; the
+  discovery Redis is the one shared piece of region state.
+
+The boot self-check (`internal/wrap/cluster.go`) AUTHs, `SELECT`s the
+configured DB, and `PING`s — so a missing/misconfigured/forbidden Redis fails
+fast instead of yielding a half-up SFU.
+
+## Recording retention / lifecycle
+
+`vulos-meet` tracks a **local lifecycle ledger** for each egress recording
+(`recording → available → expired → deleted`, plus `failed`) and runs a
+configurable **retention** sweep. The recording **blob** (the object in
+S3/Tigris) is owned by the `vulos-cloud` `MEET-RECORDING-01` sink —
+`vulos-meet` never holds the bytes. The sweep decides what is past-retention
+(by TTL and/or per-room / per-tenant count caps) and dispatches the actual
+delete through a seam:
+
+- **Self-host (no `recording.cloud_delete_base_url`):** no central blob; the
+  ledger advances straight to `deleted` (no-op deleter).
+- **Cloud:** set `recording.cloud_delete_base_url` to the `MEET-RECORDING-01`
+  control endpoint; the sweep issues
+  `DELETE {base}/v1/recordings/{egress_id}` (bearer from
+  `MEET_RECORDING_CLOUD_TOKEN`) and the **cloud** performs the S3 DeleteObject.
+
+Config (`recording:` block): `retention_ttl`, `retention_max_per_room`,
+`retention_max_per_tenant`, `retention_sweep_interval` (default `1h` when any
+rule is set), `cloud_delete_base_url`.
+
+---
+
 ## License
 
 MIT — see [LICENSE](LICENSE). LiveKit Server is Apache 2.0 (it is invoked as

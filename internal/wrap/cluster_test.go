@@ -160,6 +160,13 @@ cluster:
 // lets the self-check test run without a real Redis dep. The implementation
 // is the smallest valid RESP parser that handles the two commands we send.
 func fakeRedis(t *testing.T, respondPong bool, requirePassword string) string {
+	return fakeRedisCapture(t, respondPong, requirePassword, nil)
+}
+
+// fakeRedisCapture is fakeRedis with an optional capture slice that records the
+// argument of each SELECT command, so a test can assert the self-check routed
+// to the configured DB.
+func fakeRedisCapture(t *testing.T, respondPong bool, requirePassword string, selectArgs *[]string) string {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -187,6 +194,15 @@ func fakeRedis(t *testing.T, respondPong bool, requirePassword string) string {
 				if requirePassword != "" && (len(args) < 2 || args[1] != requirePassword) {
 					_, _ = conn.Write([]byte("-ERR wrong password\r\n"))
 					return
+				}
+				_, _ = conn.Write([]byte("+OK\r\n"))
+			case "SELECT":
+				// Accept any DB index the self-check asks for. The DB-routing
+				// test asserts the SELECT is issued by recording the argument.
+				if selectArgs != nil {
+					if len(args) >= 2 {
+						*selectArgs = append(*selectArgs, args[1])
+					}
 				}
 				_, _ = conn.Write([]byte("+OK\r\n"))
 			case "PING":
@@ -278,6 +294,29 @@ func TestCluster_PingRedis_ReachablePongs(t *testing.T) {
 	cfg.Cluster.Redis.Addr = addr
 	if err := PingClusterRedis(context.Background(), cfg); err != nil {
 		t.Fatalf("ping: %v", err)
+	}
+}
+
+// TestCluster_PingRedis_UsesProvisionedDBAndAuth confirms the self-check uses
+// the PROVISIONED connection params (the docker-compose/fly-redis artifact wires
+// addr + password + db): it AUTHs with the configured password AND SELECTs the
+// configured DB before PING — i.e. it verifies the exact keyspace LiveKit will
+// use for node discovery, not just db 0.
+func TestCluster_PingRedis_UsesProvisionedDBAndAuth(t *testing.T) {
+	var selects []string
+	addr := fakeRedisCapture(t, true, "provisioned-pw", &selects)
+	cfg := &Config{
+		Region: "za-jhb",
+		Media:  MediaConfig{CascadingSFU: cascadingEnabled(true)},
+	}
+	cfg.Cluster.Redis.Addr = addr
+	cfg.Cluster.Redis.Password = "provisioned-pw"
+	cfg.Cluster.Redis.DB = 3
+	if err := PingClusterRedis(context.Background(), cfg); err != nil {
+		t.Fatalf("self-check against provisioned redis should pass: %v", err)
+	}
+	if len(selects) != 1 || selects[0] != "3" {
+		t.Fatalf("self-check must SELECT the provisioned DB 3, got SELECTs=%v", selects)
 	}
 }
 
