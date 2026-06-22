@@ -91,6 +91,15 @@ type Metrics struct {
 	retentionDeletedTotal   uint64
 	retentionDeleteErrTotal uint64
 	retentionBytesFreed     uint64
+
+	// meet_rooms_total{event="started"|"finished"} — room lifecycle transitions
+	// observed on the usage webhook receiver (the cp metering surface).
+	meetRooms map[string]uint64
+
+	// meet_minutes_total{tenant="<id>"} — cumulative participant-minutes metered
+	// per tenant as rooms finish. This is the value reported to cp; exposing it
+	// here lets a scrape reconcile against the central bill.
+	meetMinutes map[string]uint64
 }
 
 // roomKey is the (tenant, room) composite used as the participants-in-room
@@ -130,7 +139,41 @@ func NewMetrics() *Metrics {
 		participantsInRoom: make(map[roomKey]int),
 		egressLifecycle:    make(map[string]uint64),
 		recordingLifecycle: make(map[string]uint64),
+		meetRooms:          make(map[string]uint64),
+		meetMinutes:        make(map[string]uint64),
 	}
+}
+
+// MeetRoom is the bounded label set on the meet_rooms_total counter recorded by
+// the usage webhook receiver.
+type MeetRoom string
+
+const (
+	MeetRoomStarted  MeetRoom = "started"
+	MeetRoomFinished MeetRoom = "finished"
+)
+
+// ObserveMeetRoom records one room lifecycle transition (started/finished) seen
+// on the usage webhook receiver. Nil-tolerant.
+func (m *Metrics) ObserveMeetRoom(ev MeetRoom) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.meetRooms[string(ev)]++
+}
+
+// ObserveMeetMinutes accumulates participant-minutes metered for a tenant as a
+// room finishes (the value reported to cp). Nil-tolerant; ignores non-positive
+// counts and empty tenants.
+func (m *Metrics) ObserveMeetMinutes(tenant string, minutes int64) {
+	if m == nil || tenant == "" || minutes <= 0 {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.meetMinutes[tenant] += uint64(minutes)
 }
 
 // EgressOutcome is the small, bounded set of labels on the egress-requests
@@ -444,6 +487,14 @@ func (m *Metrics) writeText(w io.Writer) {
 	retDeleted := m.retentionDeletedTotal
 	retDeleteErr := m.retentionDeleteErrTotal
 	retBytesFreed := m.retentionBytesFreed
+	meetRooms := make(map[string]uint64, len(m.meetRooms))
+	for k, v := range m.meetRooms {
+		meetRooms[k] = v
+	}
+	meetMinutes := make(map[string]uint64, len(m.meetMinutes))
+	for k, v := range m.meetMinutes {
+		meetMinutes[k] = v
+	}
 	m.mu.Unlock()
 
 	// admin_requests_total
@@ -598,6 +649,33 @@ func (m *Metrics) writeText(w io.Writer) {
 	_, _ = io.WriteString(w, "# HELP vulos_meet_retention_bytes_freed_total Cumulative bytes freed by confirmed retention deletions.\n")
 	_, _ = io.WriteString(w, "# TYPE vulos_meet_retention_bytes_freed_total counter\n")
 	fmt.Fprintf(w, "vulos_meet_retention_bytes_freed_total %d\n", retBytesFreed)
+
+	// meet_rooms_total (counter, event-labelled) — room lifecycle transitions
+	// observed on the usage webhook receiver (the cp metering surface).
+	_, _ = io.WriteString(w, "# HELP vulos_meet_meet_rooms_total Count of meet room lifecycle transitions by event (started/finished).\n")
+	_, _ = io.WriteString(w, "# TYPE vulos_meet_meet_rooms_total counter\n")
+	mrKeys := make([]string, 0, len(meetRooms))
+	for k := range meetRooms {
+		mrKeys = append(mrKeys, k)
+	}
+	sort.Strings(mrKeys)
+	for _, k := range mrKeys {
+		fmt.Fprintf(w, "vulos_meet_meet_rooms_total{event=%q} %d\n", k, meetRooms[k])
+	}
+
+	// meet_minutes_total (counter, tenant-labelled) — cumulative participant-
+	// minutes metered per tenant as rooms finish. This is the value reported to
+	// the cp control plane.
+	_, _ = io.WriteString(w, "# HELP vulos_meet_meet_minutes_total Cumulative participant-minutes metered per tenant as rooms finish (reported to cp).\n")
+	_, _ = io.WriteString(w, "# TYPE vulos_meet_meet_minutes_total counter\n")
+	mmKeys := make([]string, 0, len(meetMinutes))
+	for k := range meetMinutes {
+		mmKeys = append(mmKeys, k)
+	}
+	sort.Strings(mmKeys)
+	for _, k := range mmKeys {
+		fmt.Fprintf(w, "vulos_meet_meet_minutes_total{tenant=%q} %d\n", escapeLabel(k), meetMinutes[k])
+	}
 }
 
 // escapeLabel applies the Prometheus exposition-format escapes required for

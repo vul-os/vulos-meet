@@ -49,7 +49,15 @@ type AdminServer struct {
 	geo        *GeoRouter
 	adminToken string
 	version    string
-	metrics    *Metrics // optional — nil disables metrics emission
+	metrics    *Metrics     // optional — nil disables metrics emission
+	usage      UsageStatter // optional — nil disables the usage stats read
+}
+
+// UsageStatter is the read-only seam the admin surface uses to expose live
+// meet-usage stats (participant-minutes per room). It is satisfied by
+// *UsageReceiver. Optional: when nil, GET /admin/tenants/{t}/usage 404s.
+type UsageStatter interface {
+	Snapshot(tenant string) []RoomUsageSnapshot
 }
 
 // NewAdminServer constructs the admin surface. adminToken MUST be non-empty
@@ -87,6 +95,13 @@ func (s *AdminServer) SetMetrics(m *Metrics) {
 	s.metrics = m
 }
 
+// SetUsageStatter attaches the meet-usage stats source so the admin surface can
+// serve GET /admin/tenants/{tenant}/usage. Optional; nil clears it (the route
+// then returns 404). Wired in main.go from the usage webhook receiver.
+func (s *AdminServer) SetUsageStatter(u UsageStatter) {
+	s.usage = u
+}
+
 // Handler returns the http.Handler registering all /admin routes. The router
 // is kept in this method (not as a free function) so callers can mount the
 // admin surface under a sub-path if they want.
@@ -98,6 +113,7 @@ func (s *AdminServer) Handler() http.Handler {
 	mux.HandleFunc("GET /admin/health", s.handleHealth)
 	mux.HandleFunc("GET /admin/tenants/{tenant}/rooms", s.guardedTenant(s.handleListRooms))
 	mux.HandleFunc("DELETE /admin/tenants/{tenant}/rooms/{room}", s.guardedTenant(s.handleDeleteRoom))
+	mux.HandleFunc("GET /admin/tenants/{tenant}/usage", s.guardedTenant(s.handleUsage))
 	return instrumentAdmin(s.metrics, mux)
 }
 
@@ -231,6 +247,25 @@ func (s *AdminServer) refreshParticipantGauges(ctx context.Context, tenant strin
 		short := strings.TrimPrefix(rp.Name, prefix)
 		s.metrics.SetParticipantsInRoom(tenant, short, rp.NumParticipants)
 	}
+}
+
+// usageResponse is the JSON shape returned by GET /admin/tenants/{t}/usage. It
+// is the same data vulos-meet meters to cp, exposed read-only so an operator can
+// reconcile the live participant-minute accrual without scraping cp.
+type usageResponse struct {
+	Tenant string              `json:"tenant"`
+	Rooms  []RoomUsageSnapshot `json:"rooms"`
+}
+
+func (s *AdminServer) handleUsage(w http.ResponseWriter, r *http.Request, tenant string) {
+	if s.usage == nil {
+		// Usage tracking not wired (no usage receiver attached). Distinct from
+		// "no active rooms" — the feature is simply not present.
+		http.Error(w, "usage stats not available", http.StatusNotFound)
+		return
+	}
+	rooms := s.usage.Snapshot(tenant)
+	writeJSON(w, http.StatusOK, usageResponse{Tenant: tenant, Rooms: rooms})
 }
 
 func (s *AdminServer) handleDeleteRoom(w http.ResponseWriter, r *http.Request, tenant string) {

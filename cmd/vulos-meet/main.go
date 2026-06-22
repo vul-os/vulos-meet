@@ -24,6 +24,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/vul-os/vulos-meet/internal/cp"
 	"github.com/vul-os/vulos-meet/internal/wrap"
 )
 
@@ -155,6 +156,45 @@ func run(configPath, adminAddrOverride, metricsAddrOverride string) error {
 		return err
 	}
 
+	// OPTIONAL cp metering seam. The control-plane usage client is built ONLY
+	// when CP_URL is set; when it is unset the seam is OFF and vulos-meet is the
+	// standalone, cp-free product. The core (wrap) never imports internal/cp —
+	// this is the ONLY place the two meet. The client satisfies
+	// wrap.UsageReporter structurally; wrap sees only the interface.
+	var usageReporter wrap.UsageReporter
+	var cpClient *cp.UsageClient
+	if cpURL := os.Getenv(cp.EnvCPURL); cpURL != "" {
+		c, err := cp.NewUsageClient(cp.Config{
+			URL:          cpURL,
+			SharedSecret: os.Getenv(cp.EnvCPSharedSecret),
+		})
+		if err != nil {
+			return err
+		}
+		cpClient = c
+		usageReporter = c
+		log.Printf("vulos-meet: cp metering ENABLED (CP_URL set) — reporting meet usage to control plane")
+	} else {
+		log.Printf("vulos-meet: cp metering disabled (CP_URL unset) — running standalone")
+	}
+
+	// Meet-usage webhook receiver: verifies the LiveKit signature on
+	// room/participant lifecycle events, computes participant-minutes per room,
+	// and reports them to cp (when wired) as each room finishes. With no
+	// reporter it still verifies + tracks for the admin usage read.
+	usageRx, err := wrap.NewUsageReceiver(wrap.UsageReceiverConfig{
+		Tenant:    tenant,
+		APIKey:    cfg.LiveKit.APIKey,
+		APISecret: cfg.LiveKit.APISecret,
+		Reporter:  usageReporter,
+		Metrics:   metrics,
+	})
+	if err != nil {
+		return err
+	}
+	// Expose the live participant-minute accrual on the admin stats read.
+	admin.SetUsageStatter(usageRx)
+
 	// Retention cleanup driver. The blob deleter is the genuinely-external seam:
 	// when recording.cloud_delete_base_url is set, deletions are dispatched to
 	// the vulos-cloud MEET-RECORDING-01 sink (the blob owner); otherwise the
@@ -212,10 +252,18 @@ func run(configPath, adminAddrOverride, metricsAddrOverride string) error {
 		}
 	}()
 
+	// Sibling handler for the signal-gate's non-signaling routes: the egress
+	// webhook receiver AND the meet-usage webhook receiver share the listener.
+	// Each mounts its own distinct path, so a single mux dispatches both without
+	// either shadowing the other.
+	siblingMux := http.NewServeMux()
+	siblingMux.Handle(wrap.WebhookPath, egressRx.Handler())
+	siblingMux.Handle(wrap.UsageWebhookPath, usageRx.Handler())
+
 	// Signaling gate (reverse proxy in front of /rtc).
 	signalSrv := &http.Server{
 		Addr:              cfg.SignalGateAddr(),
-		Handler:           signalGate.Handler(egressRx.Handler(), egressProxy),
+		Handler:           signalGate.Handler(siblingMux, egressProxy),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	wg.Add(1)
@@ -265,6 +313,11 @@ func run(configPath, adminAddrOverride, metricsAddrOverride string) error {
 	_ = metricsSrv.Shutdown(shutdownCtx)
 	_ = signalSrv.Shutdown(shutdownCtx)
 	rooms.Close()
+	if cpClient != nil {
+		// Flush any queued usage events before exit (bounded by the client's
+		// own retry budget). nil-safe.
+		_ = cpClient.Close()
+	}
 
 	wg.Wait()
 	return nil
