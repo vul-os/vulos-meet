@@ -6,6 +6,7 @@ package wrap
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"sync"
 	"time"
@@ -43,10 +44,15 @@ import (
 // and tracks minutes for the admin stats read.
 //
 // account is the Vulos tenant/account the usage is billed to; kind is the usage
-// kind (UsageKindMeetMinutes); count is the magnitude. Implementations MUST be
-// fire-and-forget — Report must not block the webhook hot path.
+// kind (UsageKindMeetMinutes); count is the magnitude. idempotencyKey is a
+// stable identifier for this logical usage event: the SAME key is presented on
+// every delivery attempt (including reporter-internal retries) so the cp can
+// dedupe and a momentary blip retried doesn't double-count minutes. The receiver
+// derives a deterministic key per room lifecycle (see idempotencyKeyFor).
+// Implementations MUST be fire-and-forget — Report must not block the webhook
+// hot path.
 type UsageReporter interface {
-	Report(account, kind string, count int64)
+	Report(account, kind string, count int64, idempotencyKey string)
 }
 
 // UsageKindMeetMinutes is the usage kind reported for participant-minutes. It
@@ -261,8 +267,12 @@ func (u *UsageReceiver) apply(event, fullRoom, tenant, short, identity string) {
 		u.metrics.ObserveMeetRoom(MeetRoomFinished)
 		u.metrics.ObserveMeetMinutes(ru.tenant, minutes)
 		if u.reporter != nil && minutes > 0 {
-			// Fire-and-forget; the reporter (cp client) must not block.
-			u.reporter.Report(ru.tenant, UsageKindMeetMinutes, minutes)
+			// Fire-and-forget; the reporter (cp client) must not block. The
+			// idempotency key is deterministic per room lifecycle so any
+			// reporter-internal retry presents the same key and the cp can
+			// dedupe rather than double-count minutes.
+			key := idempotencyKeyFor(ru.tenant, ru.shortRoom, ru.startedAt, now)
+			u.reporter.Report(ru.tenant, UsageKindMeetMinutes, minutes, key)
 		}
 		delete(u.rooms, fullRoom)
 	}
@@ -316,6 +326,21 @@ func (u *UsageReceiver) Snapshot(tenant string) []RoomUsageSnapshot {
 		})
 	}
 	return out
+}
+
+// idempotencyKeyFor derives a stable identifier for the usage event emitted
+// when a room finishes. It is deterministic in the room's identity and its
+// start/finish boundary, so:
+//
+//   - reporter-internal retries of the SAME finish present the SAME key (the cp
+//     dedupes instead of double-counting minutes), and
+//   - two distinct rooms — or the same short room reused after it finished and a
+//     fresh one started — produce DISTINCT keys (no accidental dedupe).
+//
+// startedAt may be zero for a room whose start we never saw; the finished
+// timestamp still disambiguates it from any other lifecycle.
+func idempotencyKeyFor(tenant, shortRoom string, startedAt, finishedAt time.Time) string {
+	return fmt.Sprintf("meet:%s:%s:%d:%d", tenant, shortRoom, unixOrZero(startedAt), finishedAt.Unix())
 }
 
 // minutesBetween returns the whole-and-fractional minutes between two times,

@@ -23,12 +23,20 @@
 //
 //	POST {CP_URL}/api/usage
 //	Header: X-Relay-Auth: <CP_SHARED_SECRET>
-//	Body:   {"product":"meet","account_id":"<tenant>","kind":"meet_minutes","count":<n>}
+//	Header: Idempotency-Key: <stable-per-event key>   (when supplied)
+//	Body:   {"product":"meet","account_id":"<tenant>","kind":"meet_minutes","count":<n>,"idempotency_key":"<key>"}
 //
 // Delivery is fire-and-forget with a bounded retry: a Report call enqueues
 // the event and returns immediately; a background worker drains the queue and
 // retries transient failures a bounded number of times. The metering path must
 // never block the LiveKit webhook hot path.
+//
+// Every delivery attempt for the same logical event carries the SAME
+// idempotency key (the key is fixed when the event is enqueued, not regenerated
+// per retry), so a transient blip that forces a retry does not double-count
+// minutes: the cp dedupes on the key. Events that the client gives up on (queue
+// full, or all retries exhausted) increment a dropped counter so silent loss is
+// visible (Dropped()) rather than invisible.
 package cp
 
 import (
@@ -39,6 +47,7 @@ import (
 	"log"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -60,6 +69,11 @@ type usageEvent struct {
 	AccountID string `json:"account_id"`
 	Kind      string `json:"kind"`
 	Count     int64  `json:"count"`
+	// IdempotencyKey is a stable per-event identifier. The SAME key is sent on
+	// every delivery attempt for this event (including retries) so the cp can
+	// dedupe and a retried blip does not double-count. Omitted from the wire
+	// (and the Idempotency-Key header) when empty.
+	IdempotencyKey string `json:"idempotency_key,omitempty"`
 }
 
 // Config configures the cp usage client.
@@ -104,6 +118,12 @@ type UsageClient struct {
 	wg     sync.WaitGroup
 	logger *log.Logger
 
+	// dropped counts usage events the client could not deliver: enqueue failed
+	// because the bounded queue was full, OR every bounded retry was exhausted.
+	// Exposed via Dropped() so silent loss of metered minutes becomes visible to
+	// a scrape/alert instead of vanishing.
+	dropped atomic.Int64
+
 	closeOnce sync.Once
 	done      chan struct{}
 }
@@ -145,39 +165,62 @@ func NewUsageClient(cfg Config) (*UsageClient, error) {
 // ReportMeetMinutes enqueues a meet_minutes usage event for the given account
 // (tenant). It is fire-and-forget: it returns immediately and never blocks. A
 // non-positive count or empty account is ignored. When the queue is full the
-// event is dropped with a log line rather than blocking the caller.
-func (c *UsageClient) ReportMeetMinutes(accountID string, minutes int64) {
+// event is dropped (logged + counted) rather than blocking the caller.
+//
+// idempotencyKey is a stable per-event identifier; pass "" if the caller has no
+// key (no dedupe protection then). The same key MUST be reused if the caller
+// ever re-reports the same logical event.
+func (c *UsageClient) ReportMeetMinutes(accountID string, minutes int64, idempotencyKey string) {
 	if c == nil || accountID == "" || minutes <= 0 {
 		return
 	}
-	ev := usageEvent{
-		Product:   Product,
-		AccountID: accountID,
-		Kind:      KindMeetMinutes,
-		Count:     minutes,
-	}
-	select {
-	case c.queue <- ev:
-	default:
-		// Bounded queue full — drop rather than block the webhook path. Usage
-		// metering is best-effort; back-pressure on the LiveKit hot path is not
-		// acceptable.
-		c.logger.Printf("vulos-meet/cp: usage queue full, dropping %s account=%s count=%d", ev.Kind, ev.AccountID, ev.Count)
-	}
+	c.enqueue(usageEvent{
+		Product:        Product,
+		AccountID:      accountID,
+		Kind:           KindMeetMinutes,
+		Count:          minutes,
+		IdempotencyKey: idempotencyKey,
+	})
 }
 
 // Report is the generic enqueue used by the wrap.UsageReporter seam. account is
-// the tenant; kind is the usage kind (KindMeetMinutes); count is the magnitude.
-func (c *UsageClient) Report(account, kind string, count int64) {
+// the tenant; kind is the usage kind (KindMeetMinutes); count is the magnitude;
+// idempotencyKey is the stable per-event dedupe key supplied by the receiver.
+func (c *UsageClient) Report(account, kind string, count int64, idempotencyKey string) {
 	if c == nil || account == "" || count <= 0 {
 		return
 	}
-	ev := usageEvent{Product: Product, AccountID: account, Kind: kind, Count: count}
+	c.enqueue(usageEvent{
+		Product:        Product,
+		AccountID:      account,
+		Kind:           kind,
+		Count:          count,
+		IdempotencyKey: idempotencyKey,
+	})
+}
+
+// enqueue offers an event to the bounded queue. When the queue is full it drops
+// the event (logged + counted) rather than blocking the caller — back-pressure
+// on the LiveKit webhook hot path is not acceptable; usage metering is
+// best-effort and a drop is made visible via Dropped() instead of silent.
+func (c *UsageClient) enqueue(ev usageEvent) {
 	select {
 	case c.queue <- ev:
 	default:
-		c.logger.Printf("vulos-meet/cp: usage queue full, dropping %s account=%s count=%d", ev.Kind, ev.AccountID, ev.Count)
+		c.dropped.Add(1)
+		c.logger.Printf("vulos-meet/cp: usage queue full, dropping %s account=%s count=%d key=%s", ev.Kind, ev.AccountID, ev.Count, ev.IdempotencyKey)
 	}
+}
+
+// Dropped returns the cumulative count of usage events the client could not
+// deliver (queue full at enqueue, or all retries exhausted). A non-zero value
+// means metered minutes were lost and the cp bill will under-count — surface it
+// on a scrape/alert. Nil-tolerant.
+func (c *UsageClient) Dropped() int64 {
+	if c == nil {
+		return 0
+	}
+	return c.dropped.Load()
 }
 
 // drain is the single background worker that POSTs queued events with bounded
@@ -220,6 +263,11 @@ func (c *UsageClient) post(ev usageEvent) {
 		if c.cfg.SharedSecret != "" {
 			req.Header.Set("X-Relay-Auth", c.cfg.SharedSecret)
 		}
+		if ev.IdempotencyKey != "" {
+			// Surface the dedupe key as a header too so a cp that keys on the
+			// header (rather than parsing the body) still dedupes retries.
+			req.Header.Set("Idempotency-Key", ev.IdempotencyKey)
+		}
 		resp, err := c.cfg.HTTPClient.Do(req)
 		cancel()
 		if err != nil {
@@ -229,14 +277,19 @@ func (c *UsageClient) post(ev usageEvent) {
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			return
 		}
-		// 4xx is a caller bug the cp will keep rejecting — do not retry.
+		// 4xx is a caller bug the cp will keep rejecting — do not retry. The
+		// minutes still never landed, so count it as dropped.
 		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
-			c.logger.Printf("vulos-meet/cp: usage POST rejected %d (account=%s kind=%s) — not retrying", resp.StatusCode, ev.AccountID, ev.Kind)
+			c.dropped.Add(1)
+			c.logger.Printf("vulos-meet/cp: usage POST rejected %d (account=%s kind=%s key=%s) — not retrying", resp.StatusCode, ev.AccountID, ev.Kind, ev.IdempotencyKey)
 			return
 		}
 		// 5xx — retry.
 	}
-	c.logger.Printf("vulos-meet/cp: usage POST gave up after %d attempts (account=%s kind=%s count=%d)", c.cfg.MaxAttempts, ev.AccountID, ev.Kind, ev.Count)
+	// All bounded retries exhausted: the minutes were lost. Count + log so the
+	// loss is visible (the cp bill will under-count for this event).
+	c.dropped.Add(1)
+	c.logger.Printf("vulos-meet/cp: usage POST gave up after %d attempts (account=%s kind=%s count=%d key=%s)", c.cfg.MaxAttempts, ev.AccountID, ev.Kind, ev.Count, ev.IdempotencyKey)
 }
 
 // Close stops accepting new events, drains what is queued, and waits for the

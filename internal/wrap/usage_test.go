@@ -22,12 +22,13 @@ type reportCall struct {
 	account string
 	kind    string
 	count   int64
+	idemKey string
 }
 
-func (f *fakeReporter) Report(account, kind string, count int64) {
+func (f *fakeReporter) Report(account, kind string, count int64, idempotencyKey string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.reports = append(f.reports, reportCall{account, kind, count})
+	f.reports = append(f.reports, reportCall{account, kind, count, idempotencyKey})
 }
 
 func (f *fakeReporter) all() []reportCall {
@@ -189,6 +190,34 @@ func TestUsage_ComputesParticipantMinutes(t *testing.T) {
 	}
 	if r.count != 40 {
 		t.Fatalf("participant-minutes: got %d want 40", r.count)
+	}
+	// The receiver must attach a deterministic idempotency key so a reporter
+	// retry cannot double-count. Key is meet:<tenant>:<short>:<start>:<finish>.
+	wantKey := idempotencyKeyFor("acme", "standup", time.Unix(1_700_000_000, 0), time.Unix(1_700_000_000+30*60, 0))
+	if r.idemKey != wantKey {
+		t.Fatalf("idempotency key: got %q want %q", r.idemKey, wantKey)
+	}
+}
+
+// TestUsage_IdempotencyKeyDeterministicAndDistinct asserts the key is stable for
+// a given room lifecycle (so retries dedupe) yet distinct across separate
+// lifecycles of the same short room (so a later meeting is not deduped away).
+func TestUsage_IdempotencyKeyDeterministicAndDistinct(t *testing.T) {
+	t0 := time.Unix(1_700_000_000, 0)
+	a := idempotencyKeyFor("acme", "standup", t0, t0.Add(10*time.Minute))
+	b := idempotencyKeyFor("acme", "standup", t0, t0.Add(10*time.Minute))
+	if a != b {
+		t.Fatalf("same lifecycle must produce the same key: %q vs %q", a, b)
+	}
+	// A second meeting in the same short room (different start/finish) must NOT
+	// collide with the first.
+	later := idempotencyKeyFor("acme", "standup", t0.Add(time.Hour), t0.Add(time.Hour+10*time.Minute))
+	if later == a {
+		t.Fatalf("distinct lifecycles must produce distinct keys, both = %q", a)
+	}
+	// Cross-tenant must not collide either.
+	if other := idempotencyKeyFor("globex", "standup", t0, t0.Add(10*time.Minute)); other == a {
+		t.Fatalf("cross-tenant keys must differ, both = %q", a)
 	}
 }
 
