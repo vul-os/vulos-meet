@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="logo.svg" width="76" alt="Vulos Meet" />
+
 # Vulos Meet
 
 **Open-source video meetings for Vulos — LiveKit SFU with Vulos auth + multi-tenancy**
