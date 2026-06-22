@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="logo.svg" width="76" alt="Vulos Meet" />
+<img src="logo.png" width="76" alt="Vulos Meet" />
 
 # Vulos Meet
 
