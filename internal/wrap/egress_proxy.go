@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 )
 
@@ -54,10 +55,11 @@ import (
 //     not just signaling outcomes.
 //   - We do not have to read the request body to decide auth.
 type EgressProxy struct {
-	validator *Validator
-	upstream  *url.URL
-	client    *http.Client
-	metrics   *Metrics // optional — nil disables egress metrics emission
+	validator    *Validator
+	upstream     *url.URL
+	client       *http.Client
+	metrics      *Metrics // optional — nil disables egress metrics emission
+	brokerSecret string   // gates the storage seam; empty ⇒ seam disabled
 }
 
 // SetMetrics attaches a metrics registry so every egress request feeds the
@@ -98,9 +100,10 @@ func NewEgressProxy(v *Validator, upstreamAddr string) (*EgressProxy, error) {
 		return nil, err
 	}
 	return &EgressProxy{
-		validator: v,
-		upstream:  u,
-		client:    &http.Client{},
+		validator:    v,
+		upstream:     u,
+		client:       &http.Client{},
+		brokerSecret: strings.TrimSpace(os.Getenv(StorageBrokerSecretEnv)),
 	}, nil
 }
 
@@ -164,7 +167,28 @@ func (p *EgressProxy) serve(w http.ResponseWriter, r *http.Request) {
 	// storage destination, redirect egress recording artifacts to the shared
 	// bucket (under meet/) instead of whatever bucket the cloud named in the
 	// request. Absent the seam, forward verbatim (legacy/self-host config).
+	//
+	// Broker-auth gate: the injected X-Vulos-Storage-* headers are honored ONLY
+	// when the request also proves it came from the OS gateway, by presenting
+	// the shared broker secret (X-Vulos-Storage-Broker-Auth, constant-time
+	// compared against VULOS_STORAGE_BROKER_SECRET). A request that merely sets
+	// the storage headers — without the secret, or when no secret is configured
+	// — is treated as if no seam were present and forwarded verbatim, exactly as
+	// before this gate existed. This stops an on-box caller from steering
+	// recording output at an attacker-chosen bucket by spoofing the headers.
 	seam, ok := StorageSeamFromHeader(r.Header)
+	if ok && !storageBrokerAuthorized(p.brokerSecret, r.Header) {
+		seam, ok = StorageSeam{}, false // gate closed — ignore the injected seam
+	}
+	// Endpoint safety: under an authenticated seam, refuse to ship the short-
+	// lived credentials to a plaintext/public endpoint. Fail closed (400)
+	// rather than fall back to the cloud-named bucket — storing user media in
+	// an unintended place is worse than refusing the egress.
+	if ok && !seam.endpointAllowed() {
+		p.metrics.ObserveEgress(EgressOutcomeRejected)
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
 	p.forward(w, r, seam, ok)
 }
 

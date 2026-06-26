@@ -4,7 +4,10 @@
 package wrap
 
 import (
+	"crypto/subtle"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/livekit/protocol/livekit"
@@ -30,7 +33,36 @@ const (
 	StorageAccessKeyHeader    = "X-Vulos-Storage-Access-Key"    // short-lived access key
 	StorageSecretKeyHeader    = "X-Vulos-Storage-Secret-Key"    // short-lived secret
 	StorageSessionTokenHeader = "X-Vulos-Storage-Session-Token" // optional STS session token
+
+	// StorageBrokerAuthHeader carries the shared broker secret the OS gateway
+	// presents to prove that it (and not some other on-box caller) injected the
+	// X-Vulos-Storage-* headers. The seam is honored ONLY when this matches the
+	// configured StorageBrokerSecretEnv value (constant-time). Mirrors lilmail's
+	// X-Vulos-Broker-Auth mail-broker gate.
+	StorageBrokerAuthHeader = "X-Vulos-Storage-Broker-Auth"
 )
+
+// StorageBrokerSecretEnv is the env var that gates the whole storage seam. When
+// empty, the gate is closed: injected X-Vulos-Storage-* headers are ignored and
+// egress is forwarded verbatim (the legacy/self-host contract). The OS gateway
+// sets the matching X-Vulos-Storage-Broker-Auth header on requests it proxies.
+const StorageBrokerSecretEnv = "VULOS_STORAGE_BROKER_SECRET"
+
+// storageBrokerAuthorized reports whether a request is allowed to drive the
+// storage seam: the secret must be configured (non-empty) AND the presented
+// X-Vulos-Storage-Broker-Auth header must match it under a constant-time
+// compare. Closed gate (unset secret or missing/mismatched header) ⇒ false, so
+// the caller ignores the injected headers and forwards egress unchanged.
+func storageBrokerAuthorized(secret string, h http.Header) bool {
+	if secret == "" {
+		return false // gate disabled — never trust injected storage headers
+	}
+	presented := strings.TrimSpace(h.Get(StorageBrokerAuthHeader))
+	if presented == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(presented), []byte(secret)) == 1
+}
 
 // StorageSpace is the per-product key-space all Meet artifacts are filed under
 // inside the shared per-user bucket. The contract reserves meet/ for this box.
@@ -80,6 +112,40 @@ func (s StorageSeam) KeyPrefix() string {
 		return StorageSpace
 	}
 	return p + "/" + StorageSpace
+}
+
+// endpointAllowed reports whether the injected S3 endpoint is safe to ship the
+// (short-lived) credentials to. We require https:// for any public host so the
+// keys never cross the wire in plaintext; plain http:// is tolerated only for a
+// loopback or private-network host (local dev / in-cluster MinIO). An
+// unparseable or hostless endpoint is rejected.
+func (s StorageSeam) endpointAllowed() bool {
+	u, err := url.Parse(s.Endpoint)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	switch u.Scheme {
+	case "https":
+		return true
+	case "http":
+		return isLoopbackOrPrivateHost(u.Hostname())
+	default:
+		return false
+	}
+}
+
+// isLoopbackOrPrivateHost reports whether host is "localhost" or an IP literal
+// on a loopback, RFC1918/ULA private, or link-local network. A non-IP, non-
+// localhost hostname over plain http is treated as public (not allowed).
+func isLoopbackOrPrivateHost(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast()
 }
 
 // s3Upload builds a LiveKit S3 upload destination addressing the injected
