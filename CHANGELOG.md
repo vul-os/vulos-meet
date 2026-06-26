@@ -11,6 +11,14 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Added
 
+- **Unified storage seam (OS gateway → egress).** When the Vulos OS gateway
+  injects per-request `X-Vulos-Storage-*` headers, the egress proxy rewrites
+  `Start*Egress` requests so recording/egress artifacts land in the shared
+  per-user bucket under the `meet/` key-space (file, segment, image, and direct
+  track outputs are repointed at the injected S3 bucket/creds; stream outputs
+  are left alone). Absent the seam (no endpoint header), requests are forwarded
+  verbatim and the existing egress storage config is used. A decode/encode
+  failure fails the request rather than silently storing to the wrong bucket.
 - **Token validation (`VULOS-MEET/1`).** Admission-gate validator for
   LiveKit-compatible JWTs — JWT shape, signature, `exp`/`nbf`, and the
   tenant-audience ↔ room-prefix binding. `vulos-meet` validates, never mints.

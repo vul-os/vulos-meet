@@ -160,7 +160,12 @@ func (p *EgressProxy) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	p.forward(w, r)
+	// Unified-storage seam: when the OS gateway has injected a per-user object-
+	// storage destination, redirect egress recording artifacts to the shared
+	// bucket (under meet/) instead of whatever bucket the cloud named in the
+	// request. Absent the seam, forward verbatim (legacy/self-host config).
+	seam, ok := StorageSeamFromHeader(r.Header)
+	p.forward(w, r, seam, ok)
 }
 
 // forward reads the inbound body into memory and POSTs it verbatim to the
@@ -169,7 +174,7 @@ func (p *EgressProxy) serve(w http.ResponseWriter, r *http.Request) {
 // here would either add a Twirp dep to vulos-meet OR risk content-type
 // drift breaking the proxy. The body is small (Twirp egress requests are
 // kilobytes at most), so the buffer cost is bounded.
-func (p *EgressProxy) forward(w http.ResponseWriter, r *http.Request) {
+func (p *EgressProxy) forward(w http.ResponseWriter, r *http.Request, seam StorageSeam, seamPresent bool) {
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20)) // 1 MiB cap; Twirp egress payloads are kilobytes
 	if err != nil {
 		p.metrics.ObserveEgress(EgressOutcomeRejected)
@@ -177,6 +182,25 @@ func (p *EgressProxy) forward(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = r.Body.Close()
+
+	// When the gateway-injected storage seam is present, rewrite Start*Egress
+	// bodies so recording/egress artifacts land in the shared per-user bucket.
+	// A decode/encode failure FAILS the request (400) rather than silently
+	// forwarding the original body to the wrong bucket — storing user media in
+	// the unintended place is worse than refusing the egress. Methods with no
+	// storage output (Stop/List/Update, stream-only Starts) pass through.
+	if seamPresent {
+		method := strings.TrimPrefix(r.URL.Path, EgressTwirpPathPrefix)
+		rewritten, changed, rerr := rewriteEgressBodyForSeam(method, r.Header.Get("Content-Type"), body, seam)
+		if rerr != nil {
+			p.metrics.ObserveEgress(EgressOutcomeRejected)
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if changed {
+			body = rewritten
+		}
+	}
 
 	upstreamURL := p.upstream.String() + r.URL.Path
 	if r.URL.RawQuery != "" {
@@ -224,7 +248,11 @@ func copyForwardableHeaders(dst, src http.Header) {
 	for k, vs := range src {
 		switch strings.ToLower(k) {
 		case "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
-			"te", "trailer", "transfer-encoding", "upgrade", "host":
+			"te", "trailer", "transfer-encoding", "upgrade", "host",
+			// Content-Length is recomputed by the transport from the body we
+			// actually send; copying a stale value is wrong once the seam
+			// rewrite changes the body size.
+			"content-length":
 			continue
 		}
 		for _, v := range vs {
