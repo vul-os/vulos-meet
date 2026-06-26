@@ -294,6 +294,7 @@ disk).
 | `MEET_RECORDING_CLOUD_TOKEN` | no | Bearer token for the recording-blob delete + egress-forward legs. |
 | `CP_URL` | no | **Optional metering seam.** When set, meet usage is reported to a control plane; unset = standalone. |
 | `CP_SHARED_SECRET` | no | Sent as `X-Relay-Auth` on the usage POST when the `CP_URL` seam is on. |
+| `VULOS_STORAGE_BROKER_SECRET` | no | **Optional unified-storage seam.** Gates the gateway-injected `X-Vulos-Storage-*` egress destination (matched against `X-Vulos-Storage-Broker-Auth`); unset = seam off, egress storage forwarded verbatim. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#unified-storage-seam). |
 
 The Docker entrypoint renders the YAML from a fuller set of `MEET_*` variables
 (`MEET_LIVEKIT_API_KEY`, `MEET_LIVEKIT_API_SECRET`, `MEET_REGION`,

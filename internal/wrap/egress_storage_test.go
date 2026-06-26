@@ -366,6 +366,82 @@ func TestEgressProxy_UnsafeEndpointRejected(t *testing.T) {
 	}
 }
 
+// TestEgressProxy_StorageHeadersNotForwardedToChild asserts the defense-in-depth
+// strip: the X-Vulos-Storage-* family (broker-auth secret + short-lived storage
+// credentials) and the legacy X-Vulos-Broker-Auth name are consumed by vulos-meet
+// and MUST NOT reach the loopback livekit-server child, even when the seam is fully
+// authorized and the egress body was rewritten.
+func TestEgressProxy_StorageHeadersNotForwardedToChild(t *testing.T) {
+	t.Setenv(StorageBrokerSecretEnv, "broker-secret-xyz") // gate open
+	f := &fakeLiveKitTwirp{}
+	upstream := newFakeLiveKitTwirp(t, f)
+	defer upstream.Close()
+	addr := strings.TrimPrefix(upstream.URL, "http://")
+
+	g, _ := newGateForTest(t, addr)
+	p, _ := newEgressProxyForTest(t, addr)
+	gate := httptest.NewServer(g.Handler(nil, p))
+	defer gate.Close()
+
+	reqMsg := &livekit.RoomCompositeEgressRequest{
+		RoomName: "acme:standup",
+		FileOutputs: []*livekit.EncodedFileOutput{{
+			Filepath: "standup.mp4",
+			Output:   &livekit.EncodedFileOutput_S3{S3: &livekit.S3Upload{Bucket: "cloud-original"}},
+		}},
+	}
+	body, _ := protojson.Marshal(reqMsg)
+
+	tok := mintEgressToken(t, "acme", "standup", time.Hour)
+	req, _ := http.NewRequest(http.MethodPost, gate.URL+"/twirp/livekit.Egress/StartRoomCompositeEgress", strings.NewReader(string(body)))
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(StorageBrokerAuthHeader, "broker-secret-xyz")
+	req.Header.Set("X-Vulos-Broker-Auth", "broker-secret-xyz") // legacy name
+	req.Header.Set(StorageEndpointHeader, "https://s3.vulos.test")
+	req.Header.Set(StorageBucketHeader, "user-shared")
+	req.Header.Set(StoragePrefixHeader, "users/u123")
+	req.Header.Set(StorageRegionHeader, "us-east-1")
+	req.Header.Set(StorageAccessKeyHeader, "AKIA_TEST")
+	req.Header.Set(StorageSecretKeyHeader, "secret_test")
+	req.Header.Set(StorageSessionTokenHeader, "session_test")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d want 200", resp.StatusCode)
+	}
+
+	// Sanity: the seam WAS honored (body rewritten), so we know the headers were
+	// consumed rather than ignored — yet none of them reached the child.
+	got := &livekit.RoomCompositeEgressRequest{}
+	if err := protojson.Unmarshal(f.lastBody, got); err != nil {
+		t.Fatalf("upstream body not valid proto-json: %v", err)
+	}
+	if got.FileOutputs[0].GetS3().Bucket != "user-shared" {
+		t.Fatalf("seam not honored, child body not rewritten: %+v", got.FileOutputs[0].GetS3())
+	}
+
+	mustNotForward := []string{
+		StorageEndpointHeader, StorageBucketHeader, StoragePrefixHeader,
+		StorageRegionHeader, StorageAccessKeyHeader, StorageSecretKeyHeader,
+		StorageSessionTokenHeader, StorageBrokerAuthHeader, "X-Vulos-Broker-Auth",
+	}
+	for _, h := range mustNotForward {
+		if v := f.lastHeader.Get(h); v != "" {
+			t.Errorf("header %q leaked to livekit-server child: %q", h, v)
+		}
+	}
+	// The bearer (which LiveKit re-verifies) MUST still pass through.
+	if f.lastHeader.Get("Authorization") != "Bearer "+tok {
+		t.Fatalf("Authorization not forwarded to child: %q", f.lastHeader.Get("Authorization"))
+	}
+}
+
 func TestStorageBrokerAuthorized(t *testing.T) {
 	mk := func(auth string) http.Header {
 		h := http.Header{}

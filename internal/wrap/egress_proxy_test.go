@@ -19,13 +19,14 @@ import (
 // it sees so tests can assert that (a) valid recording-tokened requests
 // reach it, (b) bad-tenant / no-RoomRecord requests do not.
 type fakeLiveKitTwirp struct {
-	hits      []string
-	lastBody  []byte
-	lastAuth  string
-	respBody  string
-	respCT    string
-	respCode  int
-	respDelay time.Duration
+	hits       []string
+	lastBody   []byte
+	lastAuth   string
+	lastHeader http.Header
+	respBody   string
+	respCT     string
+	respCode   int
+	respDelay  time.Duration
 }
 
 func newFakeLiveKitTwirp(t *testing.T, f *fakeLiveKitTwirp) *httptest.Server {
@@ -42,6 +43,7 @@ func newFakeLiveKitTwirp(t *testing.T, f *fakeLiveKitTwirp) *httptest.Server {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.hits = append(f.hits, r.URL.Path)
 		f.lastAuth = r.Header.Get("Authorization")
+		f.lastHeader = r.Header.Clone()
 		f.lastBody, _ = io.ReadAll(r.Body)
 		if f.respDelay > 0 {
 			time.Sleep(f.respDelay)

@@ -268,15 +268,31 @@ func (p *EgressProxy) forward(w http.ResponseWriter, r *http.Request, seam Stora
 // hop headers that should not survive a proxy hop. We keep the list small
 // and explicit so we don't accidentally strip something Twirp depends on
 // (Twirp's only required headers are Content-Type and the bearer).
+//
+// Defense-in-depth: the storage-seam headers (X-Vulos-Storage-* including the
+// broker-auth secret and the short-lived object-storage credentials, plus the
+// legacy X-Vulos-Broker-Auth name) are fully consumed by vulos-meet here and
+// have NO business reaching the loopback livekit-server child. We strip them
+// on every hop so a credential header never leaks downstream into the SFU
+// subprocess (nor, on the response leg, back to the caller).
 func copyForwardableHeaders(dst, src http.Header) {
 	for k, vs := range src {
-		switch strings.ToLower(k) {
+		lk := strings.ToLower(k)
+		switch lk {
 		case "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
 			"te", "trailer", "transfer-encoding", "upgrade", "host",
 			// Content-Length is recomputed by the transport from the body we
 			// actually send; copying a stale value is wrong once the seam
 			// rewrite changes the body size.
-			"content-length":
+			"content-length",
+			// Legacy broker-auth secret name (mirrors lilmail's mail-broker
+			// gate); consumed by vulos-meet, never forwarded.
+			"x-vulos-broker-auth":
+			continue
+		}
+		// Strip the entire storage-seam header family. These carry the broker
+		// secret and short-lived storage credentials, all consumed in serve().
+		if strings.HasPrefix(lk, "x-vulos-storage-") {
 			continue
 		}
 		for _, v := range vs {

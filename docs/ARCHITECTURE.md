@@ -143,6 +143,54 @@ so it adds no new trust surface. Central metering rides the separate, optional
 
 ---
 
+## Unified storage seam
+
+In a full VulOS deployment the OS gateway gives every product a shared,
+per-user object-storage bucket and brokers short-lived credentials for it. When
+the gateway proxies an egress (`/twirp/livekit.Egress/*`) request to Meet, it
+injects the destination as a family of request headers; Meet honors them by
+repointing the recording/egress S3 output at that bucket instead of whatever
+bucket the cloud named in the body. Absent the headers, Meet falls back to its
+existing egress storage config untouched — that fallback is the standalone /
+self-host contract.
+
+**Injected headers** (consumed by `internal/wrap/storage_seam.go`):
+
+| Header | Meaning |
+|---|---|
+| `X-Vulos-Storage-Endpoint` | S3 endpoint URL; **empty/absent ⇒ no seam, fall back** |
+| `X-Vulos-Storage-Bucket` | shared per-user bucket |
+| `X-Vulos-Storage-Prefix` | per-user key prefix |
+| `X-Vulos-Storage-Region` | S3 region |
+| `X-Vulos-Storage-Access-Key` / `-Secret-Key` / `-Session-Token` | short-lived credentials |
+| `X-Vulos-Storage-Broker-Auth` | shared broker secret proving the gateway injected the seam |
+
+**Broker-auth gate.** The injected headers are honored **only** when the request
+also presents `X-Vulos-Storage-Broker-Auth` matching the configured
+`VULOS_STORAGE_BROKER_SECRET` (constant-time compare). If the secret is unset
+(standalone) or the header is missing/wrong, the gate is **closed**: the seam is
+ignored and egress is forwarded verbatim, exactly as before the seam existed.
+This stops an on-box caller from steering recording output at an attacker-chosen
+bucket by spoofing the headers.
+
+**Key-space.** All Meet artifacts are filed under `<userID>/<appID>/meet/`
+within the shared bucket (the per-user prefix joined with the reserved `meet/`
+space), so products never collide in the shared bucket.
+
+**Fail-closed.** Under an authorized seam, Meet refuses to ship the short-lived
+credentials to a plaintext/public endpoint (plain `http://` is tolerated only for
+loopback / private hosts), and a body decode/encode failure during the S3
+rewrite **fails the egress (400)** rather than silently forwarding to the
+cloud-named bucket — storing user media in an unintended place is worse than
+refusing the recording.
+
+**Defense-in-depth.** The `X-Vulos-Storage-*` headers (and the legacy
+`X-Vulos-Broker-Auth` name) are stripped before the egress proxy forwards to the
+loopback `livekit-server` child — the broker secret and storage credentials are
+consumed entirely in the wrapper and never reach the SFU subprocess.
+
+---
+
 ## Security model
 
 `vulos-meet` is the sole public-facing admission seam in front of
