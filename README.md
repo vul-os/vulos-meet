@@ -10,6 +10,8 @@
 [![Go](https://img.shields.io/badge/Go-1.26+-00ADD8?logo=go&logoColor=white)](https://golang.org)
 [![SFU: LiveKit](https://img.shields.io/badge/SFU-LiveKit-FF6352.svg)](https://github.com/livekit/livekit-server)
 
+<sub><img src="logo.png" height="14" alt="VulOS"> Part of <strong><a href="https://vulos.org">VulOS</a></strong> — the open, self-hostable web OS &amp; app suite. Runs standalone, or combined under one login by <a href="https://vulos.org">Vulos Workspace</a>.</sub>
+
 *Vulos — rooted in **vula**, the Zulu and Xhosa word for **open**.*
 
 </div>
@@ -18,7 +20,7 @@
 
 ## What is Vulos Meet?
 
-Vulos Meet is the open-source (MIT, Go) video-meetings server for the Vulos
+Vulos Meet is the open-source (MIT, Go) video-meetings server for the VulOS
 suite. It is **not a fork of LiveKit** and it does not reimplement an SFU —
 it is a small Go wrapper that **supervises an upstream
 [`livekit-server`](https://github.com/livekit/livekit-server)** (the
@@ -41,11 +43,25 @@ with no dependency on any Vulos cloud service.
 
 ---
 
-## Role in the Vulos suite
+## Part of VulOS
 
-Meet is the **canonical real-time video/SFU product** for the Vulos suite —
-every product that needs live audio/video routes to a Meet room rather than
-shipping its own SFU:
+VulOS is an open, self-hostable web OS + app suite — independent products, each
+self-hostable alone and combined under one login by **Vulos Workspace**:
+
+- **Vulos Mail** — mail + calendar + contacts
+- **Vulos Talk** — team chat + channels/Spaces + huddles
+- **Vulos Meet** — video meetings (LiveKit SFU) — *this repo*
+- **Vulos Office** — documents: docs, sheets, slides, PDF
+- **Vulos Relay** — sovereign connectivity fabric
+- **Vulos Workspace** — the open suite shell (one login, app switcher, admin)
+- **Vulos OS** — the web-native desktop
+
+Workspace *links/embeds* products; products never import each other (clean
+seams). **Vulos Meet runs standalone and is combined by Vulos Workspace.**
+
+**Meet's role — the canonical real-time video/SFU product.** Every VulOS product
+that needs live audio/video routes to a Meet room rather than shipping its own
+SFU:
 
 - **Vulos Workspace** surfaces Meet as the in-suite meetings UI.
 - **Vulos Talk** hands off huddles and 1:1/group calls to a Meet room.
@@ -60,7 +76,8 @@ LiveKit client SDK. Meet validates the token and the tenant↔room binding at th
 gate; it does **not** need to know which product originated the meeting. This is
 the same admission path the standalone deployment uses, so the suite seam adds
 no new trust surface. Central usage metering rides the separate, optional
-control-plane seam (`CP_URL`, below) and is off in standalone deployments.
+control-plane seam (`CP_URL`, see [Configuration](#configuration)) and is off in
+standalone deployments.
 
 ---
 
@@ -106,6 +123,120 @@ control-plane seam (`CP_URL`, below) and is off in standalone deployments.
 - **Production media tuning by default.** VP9 simulcast (180p/360p/720p),
   top-N (3) server-side audio mixing, active-speaker detection.
 
+> Vulos Meet is a pure-backend SFU wrapper — **there is no browser UI to
+> screenshot.** See [Architecture](#architecture) for the data-plane diagram;
+> clients use the standard LiveKit SDKs.
+
+---
+
+## Quick start (standalone)
+
+Vulos Meet runs entirely on its own — **no Vulos cloud service required**. You
+need a `livekit-server` binary and a token minter (any LiveKit-compatible
+minter; the same `(api_key, api_secret)` pair on both sides).
+
+### Docker
+
+The image ([`Dockerfile`](Dockerfile)) bundles a pinned `livekit-server`, so the
+SFU comes for free; the entrypoint renders the LiveKit config from `MEET_*`
+variables (see [`docker-entrypoint.sh`](docker-entrypoint.sh)).
+
+[`docker-compose.yml`](docker-compose.yml) builds the wrapper and brings up a
+password-protected `redis` plus a `meet` instance wired to it (so you can
+exercise the cascading SFU locally). It needs three secrets in the environment:
+
+```sh
+export MEET_LIVEKIT_API_KEY=APIxxxxxxxx
+export MEET_LIVEKIT_API_SECRET=supersecretsigningvalueof32bytes
+export MEET_CLUSTER_REDIS_PASSWORD=change-me
+docker compose up         # builds meet, starts redis, then meet once redis answers PING
+```
+
+Or build and run the image standalone (no Redis; single box):
+
+```sh
+docker build -t vulos-meet .
+docker run --rm \
+  -e MEET_LIVEKIT_API_KEY=APIxxxxxxxx \
+  -e MEET_LIVEKIT_API_SECRET=supersecretsigningvalueof32bytes \
+  -e MEET_REGION=eu-fra \
+  -e MEET_ADMIN_TOKEN=change-me \
+  -p 7883:7883 \
+  vulos-meet
+```
+
+### Binary
+
+```sh
+# 1. build (pure Go, static)
+CGO_ENABLED=0 go build -o vulos-meet ./cmd/vulos-meet
+
+# 2. a livekit-server binary must be on PATH (or set VULOS_MEET_LIVEKIT_BIN).
+#    grab a release: https://github.com/livekit/livekit-server/releases
+
+# 3. minimal config.yaml
+cat > config.yaml <<'YAML'
+region: "eu-fra"            # required — the region this box advertises
+livekit:
+  api_key: "APIxxxxxxxx"    # MUST match what your token minter uses to MINT
+  api_secret: "secret..."   # the shared secret used to verify JWTs
+admin:
+  token: "change-me"        # guards /admin/* (or set MEET_ADMIN_TOKEN; env wins)
+YAML
+
+# 4. run
+./vulos-meet --config config.yaml
+```
+
+Everything else has sane defaults (codec, simulcast layers, audio mix,
+active-speaker, cascading SFU, room caps, listen addresses). The full schema —
+including `media`, `room`, `recording`, `cluster`, and `signal` blocks — lives
+in [`internal/wrap/config.go`](internal/wrap/config.go).
+
+`vulos-meet` renders a LiveKit config from your YAML, exec's `livekit-server`
+as a child, supervises it, and propagates `SIGTERM`/`SIGINT` cleanly to the
+child on shutdown. It opens four listeners:
+
+| Listener | Default | Scope | Purpose |
+|---|---|---|---|
+| signal-gate | `127.0.0.1:7883` | **public** | `/rtc` WS + `/twirp/livekit.Egress/*` + webhooks |
+| admin | `:7881` | private | `/admin/*` (bearer-token guarded) |
+| metrics | `127.0.0.1:7882` | loopback | `/metrics` (Prometheus text) |
+| livekit-server | `127.0.0.1:7880` | loopback only | the supervised SFU (signaling + Twirp) |
+
+**Flags:**
+
+```
+--config string         path to YAML config file (required)
+--addr string           admin HTTP listen address (overrides config.admin.addr)
+--metrics-addr string   metrics HTTP listen address (default "127.0.0.1:7882")
+--version               print version and exit
+```
+
+### Admin surface
+
+```
+GET    /admin/health                              # status, version, region, protocol (unauthenticated — georoute probe)
+GET    /admin/tenants/{tenant}/rooms              # list a tenant's rooms
+DELETE /admin/tenants/{tenant}/rooms/{room}       # delete a room within a tenant
+GET    /admin/tenants/{tenant}/usage              # live participant-minute accrual
+```
+
+All but `/admin/health` require `Authorization: Bearer <admin-token>`
+(constant-time compared) **and** pass through the tenant gate before reaching
+LiveKit.
+
+**Fly.io (UDP media).** A per-region [`fly.toml`](fly.toml) and a dedicated
+Redis [`fly-redis.toml`](fly-redis.toml) template are included. WebRTC media is
+raw UDP, so a **dedicated IPv4** is required; use either a narrow UDP port range
+or the single-port UDP mux (`livekit.rtc_udp_port`) — the latter sustains the
+hundreds-of-participants tier. The deploy image must contain **both** the
+`vulos-meet` and `livekit-server` binaries.
+
+For the architecture and maintaining the supervised-LiveKit relationship, see
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and
+[`CONTRIBUTING-FORK.md`](CONTRIBUTING-FORK.md).
+
 ---
 
 ## Architecture
@@ -144,84 +275,12 @@ it belongs — out of process. We import only the small
 to the SFU's own. The SFU child is bound to loopback; it is reachable **only**
 through the signal gate, never directly on the public interface.
 
----
-
-## Quickstart
-
-### Prerequisites
-
-- Go **1.26+**
-- A `livekit-server` binary on `PATH` (or pointed to by `VULOS_MEET_LIVEKIT_BIN`).
-  Grab a release from
-  [livekit/livekit-server](https://github.com/livekit/livekit-server/releases).
-- (Optional) Redis, only if you enable the cascading SFU.
-
-### Build
-
-```sh
-CGO_ENABLED=0 go build -o vulos-meet ./cmd/vulos-meet
-```
-
-### Configure
-
-`vulos-meet` takes a single YAML config. A minimal one:
-
-```yaml
-region: "eu-fra"            # required — the region this box advertises
-livekit:
-  api_key: "APIxxxxxxxx"    # MUST match what your token minter uses to MINT
-  api_secret: "secret..."   # the shared secret used to verify JWTs
-admin:
-  token: "change-me"        # guards /admin/* (or set MEET_ADMIN_TOKEN; env wins)
-```
-
-Everything else has sane defaults (codec, simulcast layers, audio mix,
-active-speaker, cascading SFU, room caps, listen addresses). The full schema —
-including `media`, `room`, `recording`, `cluster`, and `signal` blocks — lives
-in [`internal/wrap/config.go`](internal/wrap/config.go).
-
-### Run
-
-```sh
-./vulos-meet --config config.yaml
-```
-
-`vulos-meet` renders a LiveKit config from your YAML, exec's `livekit-server`
-as a child, supervises it, and propagates `SIGTERM`/`SIGINT` cleanly to the
-child on shutdown. It opens four listeners:
-
-| Listener | Default | Scope | Purpose |
-|---|---|---|---|
-| signal-gate | `127.0.0.1:7883` | **public** | `/rtc` WS + `/twirp/livekit.Egress/*` + webhooks |
-| admin | `:7881` | private | `/admin/*` (bearer-token guarded) |
-| metrics | `127.0.0.1:7882` | loopback | `/metrics` (Prometheus text) |
-| livekit-server | `127.0.0.1:7880` | loopback only | the supervised SFU (signaling + Twirp) |
-
-**Flags:**
-
-```
---config string         path to YAML config file (required)
---addr string           admin HTTP listen address (overrides config.admin.addr)
---metrics-addr string   metrics HTTP listen address (default "127.0.0.1:7882")
---version               print version and exit
-```
-
-### Admin surface
-
-```
-GET    /admin/health                              # status, version, region, protocol (unauthenticated — georoute probe)
-GET    /admin/tenants/{tenant}/rooms              # list a tenant's rooms
-DELETE /admin/tenants/{tenant}/rooms/{room}       # delete a room within a tenant
-GET    /admin/tenants/{tenant}/usage              # live participant-minute accrual
-```
-
-All but `/admin/health` require `Authorization: Bearer <admin-token>`
-(constant-time compared) **and** pass through the tenant gate before reaching
-LiveKit.
+The full component breakdown, request lifecycles, and suite seams are in
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ---
 
-## Configuration & environment variables
+## Configuration
 
 Most tuning lives in the YAML config; secrets and a few deploy knobs come from
 the environment (env overrides the config so secrets never have to ship on
@@ -254,30 +313,20 @@ minutes.
 
 ---
 
-## Self-hosting
+## Documentation
 
-`vulos-meet` is self-hostable as a standalone, cloud-free SFU. The two paths:
-
-- **Docker / Compose.** [`Dockerfile`](Dockerfile) builds the wrapper and bundles
-  a pinned `livekit-server`. [`docker-compose.yml`](docker-compose.yml) brings up
-  a password-protected `redis` plus a `meet` instance wired to it (so you can
-  exercise the cascading SFU locally); `meet` only boots once Redis answers an
-  authenticated `PING`.
-- **Fly.io (UDP media).** A per-region [`fly.toml`](fly.toml) and a dedicated
-  Redis [`fly-redis.toml`](fly-redis.toml) template are included. WebRTC media is
-  raw UDP, so a **dedicated IPv4** is required; LiveKit advertises the machine's
-  public IP in ICE candidates. Use either a narrow UDP port range or the
-  single-port UDP mux (`livekit.rtc_udp_port`) — the latter is what sustains the
-  hundreds-of-participants tier. The deploy image must contain **both** the
-  `vulos-meet` and `livekit-server` binaries.
-
-For maintaining the supervised-LiveKit relationship (tracking upstream releases,
-the deploy-image two-binary requirement, the egress-base-URL invariant), see
-[`CONTRIBUTING-FORK.md`](CONTRIBUTING-FORK.md).
+| Doc | What's in it |
+|---|---|
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Component breakdown, request lifecycles, suite seams, the supervise-vs-embed rationale. |
+| [`spec/TOKEN.md`](spec/TOKEN.md) | The `VULOS-MEET/1` token shape — claims, validation rules, forbidden patterns. |
+| [`spec/VERSIONS.md`](spec/VERSIONS.md) | The token sub-protocol version registry and bump policy. |
+| [`SECURITY-TESTING.md`](SECURITY-TESTING.md) | The adversarial (pentest-style) test methodology and attack-class matrix. |
+| [`CONTRIBUTING-FORK.md`](CONTRIBUTING-FORK.md) | Maintaining the supervised-LiveKit relationship (tracking upstream, deploy-image two-binary requirement). |
+| [`CHANGELOG.md`](CHANGELOG.md) | Notable changes (Keep a Changelog). |
 
 ---
 
-## Development & testing
+## Development
 
 ```sh
 # Build, vet, and run the full suite — pure Go, no network / Redis / livekit
@@ -286,6 +335,9 @@ CGO_ENABLED=0 go build ./... && CGO_ENABLED=0 go vet ./... && CGO_ENABLED=0 go t
 
 # Coverage
 CGO_ENABLED=0 go test ./... -cover
+
+# Format check
+gofmt -l .
 ```
 
 The codebase ships an **adversarial (pentest-style) security suite** in
@@ -321,6 +373,17 @@ opening a public issue.
 
 ---
 
+## Contributing
+
+Contributions are welcome. Because Vulos Meet supervises an upstream
+`livekit-server` rather than vendoring it, the most important contributor
+guidance is in [`CONTRIBUTING-FORK.md`](CONTRIBUTING-FORK.md): how to track
+upstream LiveKit releases, the deploy-image two-binary requirement, and the
+egress-base-URL invariant. Keep `go build`, `go vet`, `go test`, and `gofmt -l .`
+green, and add an adversarial test for any new admission-path behavior.
+
+---
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
@@ -328,3 +391,4 @@ MIT — see [LICENSE](LICENSE).
 `livekit-server` is Apache 2.0 and is invoked as a subprocess (not vendored);
 `github.com/livekit/protocol` is Apache 2.0 and imported as a Go module (the
 Apache 2.0 grant is compatible with this MIT distribution).
+</content>
