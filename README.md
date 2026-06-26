@@ -41,6 +41,29 @@ with no dependency on any Vulos cloud service.
 
 ---
 
+## Role in the Vulos suite
+
+Meet is the **canonical real-time video/SFU product** for the Vulos suite —
+every product that needs live audio/video routes to a Meet room rather than
+shipping its own SFU:
+
+- **Vulos Workspace** surfaces Meet as the in-suite meetings UI.
+- **Vulos Talk** hands off huddles and 1:1/group calls to a Meet room.
+- **Vulos Mail / Calendar** attach meeting links that resolve to a Meet room
+  (the Mail/Calendar ⇄ Meet handoff is *seam-C*).
+
+The handoff is **purely token + room join** — there is no Meet-specific RPC for
+callers to learn. A control plane (`vulos-cloud`) mints a `VULOS-MEET/1` token
+bound to `<tenant><sep><room>` (see [`spec/TOKEN.md`](spec/TOKEN.md)) and the
+client joins that room through the public **signal gate** using a standard
+LiveKit client SDK. Meet validates the token and the tenant↔room binding at the
+gate; it does **not** need to know which product originated the meeting. This is
+the same admission path the standalone deployment uses, so the suite seam adds
+no new trust surface. Central usage metering rides the separate, optional
+control-plane seam (`CP_URL`, below) and is off in standalone deployments.
+
+---
+
 ## Features
 
 - **Token validation, never minting.** Meeting tokens are minted upstream (by a

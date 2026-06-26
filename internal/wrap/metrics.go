@@ -83,7 +83,7 @@ type Metrics struct {
 
 	// Recording byte/duration accounting, accumulated as recordings finalise
 	// (available) and as the retention sweep frees them (deleted).
-	recordingBytesTotal    uint64 // cumulative bytes seen on available recordings
+	recordingBytesTotal      uint64 // cumulative bytes seen on available recordings
 	recordingDurationMsTotal uint64 // cumulative duration ms on available recordings
 
 	// Retention sweep counters, accumulated across cleanup passes.

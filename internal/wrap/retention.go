@@ -380,11 +380,11 @@ func (d *RetentionDriver) SetMetrics(m *Metrics) { d.metrics = m }
 
 // RetentionSweepResult summarises one cleanup pass for logging/tests.
 type RetentionSweepResult struct {
-	Examined    int // recordings considered
-	Expired     int // newly marked expired this pass
-	Deleted     int // blob delete confirmed and advanced to deleted
-	DeleteErrs  int // delete attempts that failed (left expired for retry)
-	BytesFreed  uint64
+	Examined      int // recordings considered
+	Expired       int // newly marked expired this pass
+	Deleted       int // blob delete confirmed and advanced to deleted
+	DeleteErrs    int // delete attempts that failed (left expired for retry)
+	BytesFreed    uint64
 	DurationFreed time.Duration
 }
 
