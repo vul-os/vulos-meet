@@ -33,6 +33,8 @@ export function useRoom() {
     toggleHand: useCallback(() => ctrlRef.current?.toggleHand(), []),
     switchDevice: useCallback((kind, id) => ctrlRef.current?.switchDevice(kind, id), []),
     sendChat: useCallback((text) => ctrlRef.current?.sendChat(text), []),
+    publishBoardData: useCallback((bytes, topic) => ctrlRef.current?.publishBoardData(bytes, topic), []),
+    onBoardData: useCallback((cb) => ctrlRef.current?.onBoardData?.(cb) ?? (() => {}), []),
     leave: useCallback(() => ctrlRef.current?.leave(), []),
   }
 

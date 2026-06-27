@@ -22,6 +22,7 @@ export class LiveRoom {
   constructor() {
     this.room = null
     this.listeners = new Set()
+    this.boardListeners = new Set()
     this.messages = []
     this.status = 'idle'
     this.error = null
@@ -70,7 +71,7 @@ export class LiveRoom {
       .on(RoomEvent.TrackUnmuted, () => this._emit())
       .on(RoomEvent.ActiveSpeakersChanged, () => this._emit())
       .on(RoomEvent.ParticipantAttributesChanged, () => this._emit())
-      .on(RoomEvent.DataReceived, (payload, participant) => this._onData(payload, participant))
+      .on(RoomEvent.DataReceived, (payload, participant, _kind, topic) => this._onData(payload, participant, topic))
       .on(RoomEvent.ConnectionStateChanged, (s) => this._onConnState(s))
       .on(RoomEvent.Reconnecting, () => {
         this.status = 'reconnecting'
@@ -138,7 +139,13 @@ export class LiveRoom {
     }
   }
 
-  _onData(payload, participant) {
+  _onData(payload, participant, topic) {
+    // Board traffic rides the same data channel under dedicated topics and is
+    // raw Yjs bytes (NOT JSON) — dispatch it to board listeners and stop.
+    if (topic === 'board' || topic === 'board-ctl') {
+      for (const cb of this.boardListeners) cb(topic, payload)
+      return
+    }
     try {
       const msg = JSON.parse(new TextDecoder().decode(payload))
       if (msg.kind === 'chat') {
@@ -151,6 +158,21 @@ export class LiveRoom {
     } catch {
       /* ignore malformed data */
     }
+  }
+
+  // ---- whiteboard data channel ----
+  // The board panel writes a small Yjs provider on top of these. Board updates
+  // are published as raw Uint8Array under a dedicated LiveKit data `topic` so
+  // they never collide with chat's JSON envelope. `topic` is either 'board'
+  // (Yjs document updates / full-state replies) or 'board-ctl' (late-join hello).
+  onBoardData(cb) {
+    this.boardListeners.add(cb)
+    return () => this.boardListeners.delete(cb)
+  }
+
+  publishBoardData(bytes, topic = 'board') {
+    if (!this.room) return
+    this.room.localParticipant.publishData(bytes, { reliable: true, topic }).catch(() => {})
   }
 
   // ---- actions ----
@@ -274,11 +296,13 @@ export class LiveRoom {
     return {
       status: this.status,
       error: this.error,
-      room: { name: this.roomName || room.name },
+      room: { name: this.roomName || room.name, id: room.name },
       tiles,
       participants,
       presenter,
       local: {
+        id: lp.identity,
+        name: lp.name || lp.identity || 'You',
         micOn: lp.isMicrophoneEnabled,
         camOn: lp.isCameraEnabled,
         screenOn: lp.isScreenShareEnabled,
@@ -293,11 +317,11 @@ function baseSnapshot(status, error, roomName, messages) {
   return {
     status,
     error,
-    room: { name: roomName },
+    room: { name: roomName, id: roomName },
     tiles: [],
     participants: [],
     presenter: null,
-    local: { micOn: false, camOn: false, screenOn: false, handRaised: false },
+    local: { id: '', name: 'You', micOn: false, camOn: false, screenOn: false, handRaised: false },
     messages,
   }
 }

@@ -91,6 +91,14 @@ export const SettingsIcon = (p) => (
   </svg>
 )
 
+export const BoardIcon = (p) => (
+  <svg {...base} {...p}>
+    <rect x="3" y="4" width="18" height="13" rx="2" />
+    <path d="M9 20l3-3 3 3" />
+    <path d="M7 12.5l3-3 2.5 2.5L17 7.5" />
+  </svg>
+)
+
 export const CloseIcon = (p) => (
   <svg {...base} {...p}>
     <path d="M6 6l12 12M18 6 6 18" />

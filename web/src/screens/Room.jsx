@@ -4,6 +4,7 @@ import ControlBar from '../components/ControlBar.jsx'
 import ParticipantsPanel from '../components/ParticipantsPanel.jsx'
 import ChatPanel from '../components/ChatPanel.jsx'
 import SettingsPanel from '../components/SettingsPanel.jsx'
+import WhiteboardPanel from '../components/WhiteboardPanel.jsx'
 import { LogoMark } from '../components/Logo.jsx'
 
 export default function Room({ snapshot, actions, devices, selectedDevices, onSelectDevice, theme, onTheme }) {
@@ -61,6 +62,14 @@ export default function Room({ snapshot, actions, devices, selectedDevices, onSe
             onSelect={onSelectDevice}
             theme={theme}
             onTheme={onTheme}
+            onClose={() => setPanel(null)}
+          />
+        )}
+        {panel === 'whiteboard' && (
+          <WhiteboardPanel
+            user={{ id: snapshot.local.id, name: snapshot.local.name }}
+            roomId={snapshot.room.id || snapshot.room.name}
+            actions={actions}
             onClose={() => setPanel(null)}
           />
         )}

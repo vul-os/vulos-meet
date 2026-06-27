@@ -10,6 +10,7 @@ import {
   ChatIcon,
   PeopleIcon,
   SettingsIcon,
+  BoardIcon,
   ChevronDownIcon,
 } from './Icons.jsx'
 
@@ -140,6 +141,14 @@ export default function ControlBar({ local, actions, devices, panel, setPanel, p
         onClick={() => setPanel(panel === 'chat' ? null : 'chat')}
       >
         <ChatIcon />
+      </ControlButton>
+
+      <ControlButton
+        label="Whiteboard"
+        active={panel === 'whiteboard'}
+        onClick={() => setPanel(panel === 'whiteboard' ? null : 'whiteboard')}
+      >
+        <BoardIcon />
       </ControlButton>
 
       <ControlButton label="Settings" active={panel === 'settings'} onClick={() => setPanel(panel === 'settings' ? null : 'settings')}>

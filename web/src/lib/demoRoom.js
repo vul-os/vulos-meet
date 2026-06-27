@@ -100,7 +100,7 @@ export class DemoRoom {
 
   _sceneState(scene) {
     const roomName = 'standup-2026-06-27'
-    const local = { micOn: true, camOn: true, screenOn: scene === 'screen-share', handRaised: false }
+    const local = { id: ME.id, name: ME.name, micOn: true, camOn: true, screenOn: scene === 'screen-share', handRaised: false }
     const messages = demoMessages()
 
     if (scene === 'connecting') {
@@ -173,6 +173,12 @@ export class DemoRoom {
     }
     this._emit()
   }
+
+  // Whiteboard has no peers in the offline demo — board edits stay local.
+  onBoardData() {
+    return () => {}
+  }
+  publishBoardData() {}
 
   async leave() {
     this.state = { ...this.state, status: 'left' }

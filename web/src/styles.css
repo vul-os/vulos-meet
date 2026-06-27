@@ -674,6 +674,16 @@ code {
   background: var(--bg-surface);
   min-height: 0;
 }
+/* The whiteboard needs real canvas room — make its panel a wide work surface. */
+.panel-board {
+  flex: 0 0 clamp(420px, 48vw, 760px);
+  width: clamp(420px, 48vw, 760px);
+}
+.board-wrap {
+  flex: 1 1 auto;
+  min-height: 0;
+  position: relative;
+}
 .panel-head {
   display: flex;
   align-items: center;

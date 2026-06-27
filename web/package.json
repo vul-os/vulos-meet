@@ -13,9 +13,11 @@
     "mint-dev-token": "node scripts/mint-dev-token.mjs"
   },
   "dependencies": {
+    "@vulos/board-ui": "file:../../board-ui",
     "livekit-client": "^2.7.0",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react-dom": "^18.3.1",
+    "yjs": "^13.6.18"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.3.4",
