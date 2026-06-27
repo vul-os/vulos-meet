@@ -90,7 +90,7 @@ export class EphemeralChatTransport extends BaseChatTransport {
 // ---- Talk-backed (persistent) ----
 //
 // Talk binding: { channelId, base, token, self }. We talk to Talk's REST message
-// API under `${base}/api/channels/{channelId}/messages`:
+// API under `${base}/api/spaces/channels/{channelId}/messages`:
 //   GET  …?limit=N   -> { messages: [...] } | [...]   (recent history)
 //   POST …           -> the created message            (send)
 // Auth is the provided token as a Bearer credential. Subscription is poll-based
@@ -154,7 +154,7 @@ export class TalkChatTransport extends BaseChatTransport {
 
   async _req(method, suffix, body) {
     if (!this._fetch) throw new Error('no fetch available')
-    const url = `${this.base}/api/channels/${encodeURIComponent(this.channelId)}/messages${suffix}`
+    const url = `${this.base}/api/spaces/channels/${encodeURIComponent(this.channelId)}/messages${suffix}`
     const headers = { 'Content-Type': 'application/json' }
     if (this.token) headers.Authorization = `Bearer ${this.token}`
     const res = await this._fetch(url, {

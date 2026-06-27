@@ -74,7 +74,7 @@ describe('createChatTransport — selection', () => {
     // Pulled recent history on start, authenticated with the Bearer token.
     expect(t.history()).toEqual([{ id: '1', from: 'Sipho', text: 'history', ts: 1000, self: false }])
     const [url, opts] = fetchImpl.mock.calls[0]
-    expect(url).toBe('https://talk.example/api/channels/c1/messages?limit=100')
+    expect(url).toBe('https://talk.example/api/spaces/channels/c1/messages?limit=100')
     expect(opts.headers.Authorization).toBe('Bearer tok')
     t.dispose()
   })
