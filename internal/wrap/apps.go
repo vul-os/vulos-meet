@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/vul-os/vulos-apps/appsplatform"
+	"github.com/vul-os/vulos-apps/mcp"
 )
 
 // This file makes vulos-meet host an "Apps & Bots place" on the shared Vulos
@@ -203,6 +204,56 @@ func (a *MeetAdapter) Read(ctx context.Context, app *appsplatform.App, req appsp
 	}
 }
 
+// MeetAdapter additionally implements mcp.Descriptor so the Meet MCP server
+// publishes a precise, per-action tool/resource surface (instead of the generic
+// passthrough). The tools/resources are EXACTLY the adapter's Act actions and
+// Read kinds — MCP is just a different shape over the same seam, with the same
+// scope and target-access checks applied by the mcp engine.
+var _ mcp.Descriptor = (*MeetAdapter)(nil)
+
+// broadcastInputSchema is the JSON Schema for the room.broadcast tool. The whole
+// arguments object becomes the action Payload; mcp lifts "target" (the room id,
+// auto-injected by the engine because AcceptsTarget is set) into the
+// ActionRequest.Target and access-checks it via CanAccessTarget before Act runs.
+const broadcastInputSchema = `{
+  "type": "object",
+  "properties": {
+    "payload": {
+      "type": "object",
+      "description": "Opaque app event body delivered to every participant in the room over the LiveKit data channel (topic vulos.apps). Must be valid JSON."
+    }
+  }
+}`
+
+// MCPTools publishes the Meet action tools (the MUTATING surface, apps:write).
+// The only Meet action is a room broadcast, addressed by a target room id.
+func (a *MeetAdapter) MCPTools() []mcp.ToolSpec {
+	return []mcp.ToolSpec{{
+		Action:        AppActionBroadcast,
+		Description:   "Broadcast an app event into a live meeting room. Delivered to every participant over the room data channel and fanned out as a platform app_event to other subscribed apps. Set `target` to the full room id.",
+		AcceptsTarget: true,
+		InputSchema:   json.RawMessage(broadcastInputSchema),
+	}}
+}
+
+// MCPResources publishes the Meet read kinds (the READ surface, apps:read): a
+// room's roster (addressed by a target room id) and the catalog of active rooms.
+func (a *MeetAdapter) MCPResources() []mcp.ResourceSpec {
+	return []mcp.ResourceSpec{
+		{
+			Kind:          AppReadParticipants,
+			Name:          "Room participants",
+			Description:   "Roster (metadata only, never media) for a single live room. Address it with the full room id as the target segment.",
+			AcceptsTarget: true,
+		},
+		{
+			Kind:        AppReadRooms,
+			Name:        "Active rooms",
+			Description: "Catalog of room ids the SFU currently holds. No target.",
+		},
+	}
+}
+
 // AppsConfig configures the Apps & Bots mount.
 type AppsConfig struct {
 	// Registry stores apps (required). The composition root supplies the
@@ -244,6 +295,49 @@ func NewAppsHandler(cfg AppsConfig) (*appsplatform.Handler, error) {
 		Dispatcher: disp,
 		Admin:      admin,
 		BasePath:   cfg.BasePath,
+	})
+}
+
+// MCPConfig configures the MCP mount. The MCP server reuses the SAME Meet
+// adapter and app registry as the REST Apps & Bots mount — MCP is a different
+// shape over the same seam — and authenticates with the SAME per-app Bearer
+// tokens (vat_…). It has no management routes and so needs no admin bearer.
+type MCPConfig struct {
+	// Registry authenticates Bearer app tokens (required) — the SAME registry the
+	// REST apps mount uses, so a token works identically over either shape.
+	Registry appsplatform.Registry
+	// SFU is the narrow LiveKit seam the adapter acts/reads through (required).
+	SFU MeetSFU
+	// BasePath is the mount prefix (default "/mcp").
+	BasePath string
+}
+
+// NewMCPHandler wires the shared @vulos/apps MCP layer for Meet: it builds a
+// Meet adapter (which implements mcp.Descriptor, so tools/resources are derived
+// precisely) over the given SFU and returns the mountable MCP handler. Mount the
+// returned handler at BasePath and BasePath+"/" on the SAME mux that serves the
+// REST /api/apps routes, behind the same signal-gate.
+//
+// Open-core discipline: the optional cloud MCP-aggregation gateway
+// (mcp.MCPConfig.Gateway) is left nil here — standalone is the only behavior
+// this core compiles in. The composition root (cmd/vulos-meet) env-gates any
+// cloud gateway selection, mirroring the registry seam; internal/wrap never
+// imports a Gateway implementation or internal/cp.
+func NewMCPHandler(cfg MCPConfig) (*mcp.Handler, error) {
+	if cfg.Registry == nil {
+		return nil, errors.New("vulos-meet: mcp handler requires a registry")
+	}
+	if cfg.SFU == nil {
+		return nil, errors.New("vulos-meet: mcp handler requires an SFU seam")
+	}
+	// A dispatcher over the SAME registry lets tool calls fan a platform event
+	// out to other subscribed apps exactly as REST actions do.
+	disp := appsplatform.NewDispatcher(cfg.Registry, appsplatform.ProductMeet)
+	return mcp.NewHandler(mcp.MCPConfig{
+		Adapter:  NewMeetAdapter(cfg.SFU),
+		Registry: cfg.Registry,
+		Emit:     disp.EmitFunc(),
+		BasePath: cfg.BasePath,
 	})
 }
 

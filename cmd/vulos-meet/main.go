@@ -38,9 +38,14 @@ const version = "0.0.1-dev"
 //	appsCloudURLEnv — selects a Vulos Cloud control-plane registry. This binary
 //	                  ships standalone-only, so setting it is a hard error rather
 //	                  than a silent downgrade.
+//	mcpGatewayEnv   — selects a Vulos Cloud MCP-aggregation gateway (one agent
+//	                  endpoint fanning out across products). This binary ships
+//	                  standalone-only, so setting it is a hard error rather than a
+//	                  silent downgrade (mirrors appsCloudURLEnv).
 const (
 	appsDBEnv       = "MEET_APPS_DB"
 	appsCloudURLEnv = "MEET_APPS_CLOUD_URL"
+	mcpGatewayEnv   = "MEET_APPS_MCP_GATEWAY_URL"
 )
 
 func main() {
@@ -242,6 +247,22 @@ func run(configPath, adminAddrOverride, metricsAddrOverride string) error {
 		return err
 	}
 
+	// MCP place: the SAME Meet adapter + app registry + per-app (vat_) tokens as
+	// the REST /api/apps mount, exposed as an MCP server so any LLM/agent can
+	// operate Meet. The optional cloud MCP-aggregation gateway is an env-gated
+	// seam: this binary compiles in no gateway, so selecting one is a hard error
+	// rather than a silent downgrade to standalone (mirrors MEET_APPS_CLOUD_URL).
+	if os.Getenv(mcpGatewayEnv) != "" {
+		return fmt.Errorf("vulos-meet: %s is set but this build has no cloud MCP gateway compiled in (standalone-only)", mcpGatewayEnv)
+	}
+	mcpHandler, err := wrap.NewMCPHandler(wrap.MCPConfig{
+		Registry: appsReg,
+		SFU:      rooms,
+	})
+	if err != nil {
+		return err
+	}
+
 	// Retention cleanup driver. The blob deleter is the genuinely-external seam:
 	// when recording.cloud_delete_base_url is set, deletions are dispatched to
 	// the vulos-cloud MEET-RECORDING-01 sink (the blob owner); otherwise the
@@ -314,6 +335,12 @@ func run(configPath, adminAddrOverride, metricsAddrOverride string) error {
 	// admin bearer; runtime routes authenticate with per-app tokens.
 	siblingMux.Handle(appsHandler.BasePath, appsHandler)
 	siblingMux.Handle(appsHandler.BasePath+"/", appsHandler)
+	// MCP server: same adapter/registry/per-app-token surface as /api/apps, in
+	// the MCP (JSON-RPC over Streamable HTTP) shape so agents can operate Meet.
+	// Mounted as exact + subtree patterns behind the same signal-gate, which
+	// continues to own /rtc + egress and strips its headers only on those paths.
+	siblingMux.Handle(mcpHandler.BasePath, mcpHandler)
+	siblingMux.Handle(mcpHandler.BasePath+"/", mcpHandler)
 	// Embedded meeting/call web client. Served at the root of the public
 	// signal-gate listener (the same origin as /rtc), so opening the meet
 	// service in a browser yields the join UI and the LiveKit client SDK

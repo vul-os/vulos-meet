@@ -9,6 +9,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/vul-os/vulos-apps/appsplatform"
@@ -170,5 +171,81 @@ func TestNewAppsHandlerListGate(t *testing.T) {
 	var apps []appsplatform.Summary
 	if err := json.NewDecoder(resp.Body).Decode(&apps); err != nil {
 		t.Fatalf("decode list: %v", err)
+	}
+}
+
+// TestNewMCPHandlerInitializeAndToolsList drives the MCP handshake
+// (initialize → tools/list) over HTTP with a per-app (vat_) token and asserts
+// the Meet adapter's Descriptor surface is published: the room.broadcast tool
+// and the participants/rooms resources.
+func TestNewMCPHandlerInitializeAndToolsList(t *testing.T) {
+	reg := appsplatform.NewMemoryRegistry(appsplatform.WithScopeSet(MeetAppScopeSet()))
+	created, err := reg.Create(appsplatform.CreateParams{
+		Name:     "agent",
+		OwnerID:  "owner",
+		Products: []string{appsplatform.ProductMeet},
+		Scopes:   []string{appsplatform.ScopeAppsRead, appsplatform.ScopeAppsWrite},
+	})
+	if err != nil {
+		t.Fatalf("create app: %v", err)
+	}
+
+	h, err := NewMCPHandler(MCPConfig{Registry: reg, SFU: &fakeSFU{rooms: []string{"acme:standup"}}})
+	if err != nil {
+		t.Fatalf("mcp handler: %v", err)
+	}
+	mux := http.NewServeMux()
+	mux.Handle(h.BasePath, h)
+	mux.Handle(h.BasePath+"/", h)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	call := func(method string, params any) map[string]any {
+		body := map[string]any{"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+		b, _ := json.Marshal(body)
+		req, _ := http.NewRequest(http.MethodPost, srv.URL+h.BasePath, strings.NewReader(string(b)))
+		req.Header.Set("Authorization", "Bearer "+created.Token)
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s: %v", method, err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("%s status = %d, want 200", method, resp.StatusCode)
+		}
+		var out map[string]any
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			t.Fatalf("%s decode: %v", method, err)
+		}
+		return out
+	}
+
+	// No token → 401 (signal-gate auth is not weakened for the MCP shape).
+	noTok, err := http.Post(srv.URL+h.BasePath, "application/json",
+		strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"initialize"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	noTok.Body.Close()
+	if noTok.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("no-token initialize status = %d, want 401", noTok.StatusCode)
+	}
+
+	init := call("initialize", map[string]any{"protocolVersion": "2025-06-18"})
+	if init["error"] != nil {
+		t.Fatalf("initialize error: %v", init["error"])
+	}
+
+	tools := call("tools/list", nil)
+	tb, _ := json.Marshal(tools["result"])
+	if !strings.Contains(string(tb), AppActionBroadcast) {
+		t.Fatalf("tools/list missing %q: %s", AppActionBroadcast, tb)
+	}
+
+	resources := call("resources/list", nil)
+	rb, _ := json.Marshal(resources["result"])
+	if !strings.Contains(string(rb), AppReadParticipants) || !strings.Contains(string(rb), AppReadRooms) {
+		t.Fatalf("resources/list missing participants/rooms: %s", rb)
 	}
 }
