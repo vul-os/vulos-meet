@@ -3,7 +3,7 @@ import PreJoin from './screens/PreJoin.jsx'
 import Room from './screens/Room.jsx'
 import AppsAndBotsView from './screens/AppsAndBotsView.jsx'
 import StatusScreen from './components/StatusScreen.jsx'
-import { parseConfig, roomDisplayName } from './lib/config.js'
+import { parseConfig, roomDisplayName, talkBinding } from './lib/config.js'
 import { useRoom } from './lib/useRoom.js'
 import { enumerate } from './lib/devices.js'
 
@@ -49,6 +49,7 @@ export default function App() {
         cam: opts.cam,
         mic: opts.mic,
         roomName: roomDisplayName(opts.room || config.room, config.separator),
+        talk: talkBinding(config),
       })
     },
     [config, connectLive],

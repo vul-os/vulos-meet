@@ -17,6 +17,7 @@ import {
   ConnectionState,
   DisconnectReason,
 } from 'livekit-client'
+import { EphemeralChatTransport, createChatTransport } from './chatTransport.js'
 
 export class LiveRoom {
   constructor() {
@@ -28,6 +29,59 @@ export class LiveRoom {
     this.error = null
     this.roomName = ''
     this._audioEls = new Map() // trackSid -> HTMLAudioElement
+
+    // In-call chat is delegated to a pluggable ChatTransport. We start on the
+    // ephemeral (data-channel) transport so chat works pre-connect and for
+    // standalone meetings; connect() may swap in a Talk-backed transport.
+    this._chatDataListeners = new Set()
+    this._chatSynced = false
+    this._chatLabel = 'ephemeral'
+    this._chatUnsub = null
+    this.chat = null
+    this._swapChat(new EphemeralChatTransport(this._chatWire()))
+  }
+
+  // The seam the ephemeral transport rides: publish a chat envelope on the
+  // dedicated 'chat' data topic, and receive inbound chat envelopes. Board
+  // traffic uses separate topics so the two never collide.
+  _chatWire() {
+    return {
+      publishChat: (text) => {
+        if (!this.room) return
+        const payload = new TextEncoder().encode(JSON.stringify({ kind: 'chat', text }))
+        this.room.localParticipant.publishData(payload, { reliable: true, topic: 'chat' }).catch(() => {})
+      },
+      onChatData: (cb) => {
+        this._chatDataListeners.add(cb)
+        return () => this._chatDataListeners.delete(cb)
+      },
+    }
+  }
+
+  _swapChat(transport) {
+    this._chatUnsub?.()
+    this.chat?.dispose?.()
+    this.chat = transport
+    this._chatSynced = !!transport.synced
+    this._chatLabel = transport.label || 'ephemeral'
+    this._chatUnsub = transport.subscribe((messages) => {
+      this.messages = messages
+      this._chatSynced = !!transport.synced
+      this._chatLabel = transport.label || 'ephemeral'
+      this._emit()
+    })
+  }
+
+  // Decide the chat transport once connected: Talk binding present + reachable ->
+  // Talk-backed (persistent); else keep the ephemeral data-channel transport.
+  async _setupChat(talk, displayName) {
+    const binding = talk ? { ...talk, self: talk.self || displayName || '' } : null
+    const next = await createChatTransport({
+      talk: binding,
+      wire: this._chatWire(),
+      fetchImpl: typeof fetch !== 'undefined' ? fetch.bind(globalThis) : undefined,
+    })
+    this._swapChat(next)
   }
 
   on(cb) {
@@ -41,7 +95,7 @@ export class LiveRoom {
     for (const cb of this.listeners) cb(snap)
   }
 
-  async connect({ serverUrl, token, displayName, cameraId, micId, mic = true, cam = true, roomName = '' }) {
+  async connect({ serverUrl, token, displayName, cameraId, micId, mic = true, cam = true, roomName = '', talk = null }) {
     this.status = 'connecting'
     this.roomName = roomName
     this._emit()
@@ -88,6 +142,9 @@ export class LiveRoom {
       if (displayName) await room.localParticipant.setName(displayName)
       this.status = 'connected'
       this._emit()
+      // Pick the chat transport now the join context is known. Talk-bound
+      // meetings get persistent chat; everything else stays ephemeral.
+      await this._setupChat(talk, displayName).catch(() => {})
       // Enable media after connect so a permission denial surfaces in-room
       // rather than silently dropping the join.
       if (cam) await room.localParticipant.setCameraEnabled(true).catch((e) => this._mediaErr(e))
@@ -150,11 +207,11 @@ export class LiveRoom {
     try {
       const msg = JSON.parse(new TextDecoder().decode(payload))
       if (msg.kind === 'chat') {
-        this.messages = [
-          ...this.messages,
-          { id: cryptoId(), from: participant?.name || participant?.identity || 'Guest', text: String(msg.text || ''), ts: Date.now(), self: false },
-        ]
-        this._emit()
+        // Hand inbound chat to whatever transport is active. The ephemeral
+        // transport ingests it; the Talk transport ignores the data channel
+        // (its source of truth is the Talk channel) so duplicates never appear.
+        const from = participant?.name || participant?.identity || 'Guest'
+        if (!this._chatSynced) for (const cb of this._chatDataListeners) cb(from, String(msg.text || ''))
       }
     } catch {
       /* ignore malformed data */
@@ -216,15 +273,11 @@ export class LiveRoom {
   }
 
   sendChat(text) {
-    const t = String(text || '').trim()
-    if (!t || !this.room) return
-    const payload = new TextEncoder().encode(JSON.stringify({ kind: 'chat', text: t }))
-    this.room.localParticipant.publishData(payload, { reliable: true }).catch(() => {})
-    this.messages = [...this.messages, { id: cryptoId(), from: 'You', text: t, ts: Date.now(), self: true }]
-    this._emit()
+    this.chat?.send?.(text)
   }
 
   async leave() {
+    this.chat?.dispose?.()
     if (this.room) await this.room.disconnect()
     this.status = 'left'
     this._emit()
@@ -311,6 +364,7 @@ export class LiveRoom {
         handRaised: lp.attributes?.handRaised === 'true',
       },
       messages: this.messages,
+      chat: { synced: this._chatSynced, label: this._chatLabel },
     }
   }
 }
@@ -325,6 +379,7 @@ function baseSnapshot(status, error, roomName, messages) {
     presenter: null,
     local: { id: '', name: 'You', micOn: false, camOn: false, screenOn: false, handRaised: false },
     messages,
+    chat: { synced: false, label: 'ephemeral' },
   }
 }
 
@@ -333,8 +388,4 @@ function friendlyError(err) {
   if (/token/i.test(m)) return 'Could not join: the meeting token was rejected or has expired.'
   if (/network|connect|websocket/i.test(m)) return 'Could not reach the meeting server. Check the connection and try again.'
   return m
-}
-
-function cryptoId() {
-  return Math.random().toString(36).slice(2) + Date.now().toString(36)
 }

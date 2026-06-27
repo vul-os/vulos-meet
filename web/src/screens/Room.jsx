@@ -57,7 +57,14 @@ export default function Room({ snapshot, actions, devices, selectedDevices, onSe
         </div>
 
         {panel === 'people' && <ParticipantsPanel participants={snapshot.participants} onClose={() => setPanel(null)} />}
-        {panel === 'chat' && <ChatPanel messages={snapshot.messages} onSend={actions.sendChat} onClose={() => setPanel(null)} />}
+        {panel === 'chat' && (
+          <ChatPanel
+            messages={snapshot.messages}
+            onSend={actions.sendChat}
+            onClose={() => setPanel(null)}
+            synced={snapshot.chat?.synced}
+          />
+        )}
         {panel === 'settings' && (
           <SettingsPanel
             devices={devices}

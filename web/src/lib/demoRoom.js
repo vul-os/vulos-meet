@@ -102,27 +102,28 @@ export class DemoRoom {
     const roomName = 'standup-2026-06-27'
     const local = { id: ME.id, name: ME.name, micOn: true, camOn: true, screenOn: scene === 'screen-share', handRaised: false }
     const messages = demoMessages()
+    const chat = { synced: false, label: 'ephemeral' }
 
     if (scene === 'connecting') {
-      return { status: 'connecting', error: null, room: { name: roomName }, tiles: [], participants: [], presenter: null, local, messages: [] }
+      return { status: 'connecting', error: null, room: { name: roomName }, tiles: [], participants: [], presenter: null, local, messages: [], chat }
     }
     if (scene === 'reconnecting') {
       const base = buildPeople()
-      return { status: 'reconnecting', error: null, room: { name: roomName }, ...base, local, messages }
+      return { status: 'reconnecting', error: null, room: { name: roomName }, ...base, local, messages, chat }
     }
     if (scene === 'ended') {
-      return { status: 'ended', error: null, room: { name: roomName }, tiles: [], participants: [], presenter: null, local, messages }
+      return { status: 'ended', error: null, room: { name: roomName }, tiles: [], participants: [], presenter: null, local, messages, chat }
     }
     if (scene === 'error') {
-      return { status: 'error', error: 'Could not reach the meeting server. Check the connection and try again.', room: { name: roomName }, tiles: [], participants: [], presenter: null, local, messages: [] }
+      return { status: 'error', error: 'Could not reach the meeting server. Check the connection and try again.', room: { name: roomName }, tiles: [], participants: [], presenter: null, local, messages: [], chat }
     }
     if (scene === 'permission-denied') {
-      return { status: 'permission-denied', error: null, room: { name: roomName }, tiles: [], participants: [], presenter: null, local, messages: [] }
+      return { status: 'permission-denied', error: null, room: { name: roomName }, tiles: [], participants: [], presenter: null, local, messages: [], chat }
     }
 
     const withScreen = scene === 'screen-share'
     const base = buildPeople({ withScreen })
-    return { status: 'connected', error: null, room: { name: roomName }, ...base, local, messages }
+    return { status: 'connected', error: null, room: { name: roomName }, ...base, local, messages, chat }
   }
 
   on(cb) {

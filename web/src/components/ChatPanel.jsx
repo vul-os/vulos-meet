@@ -9,7 +9,7 @@ function fmtTime(ts) {
   }
 }
 
-export default function ChatPanel({ messages, onSend, onClose }) {
+export default function ChatPanel({ messages, onSend, onClose, synced = false }) {
   const [text, setText] = useState('')
   const endRef = useRef(null)
 
@@ -28,7 +28,16 @@ export default function ChatPanel({ messages, onSend, onClose }) {
   return (
     <aside className="panel" aria-label="In-call chat">
       <header className="panel-head">
-        <h2>Chat</h2>
+        <div className="panel-title">
+          <h2>Chat</h2>
+          <span
+            className={`chat-sync ${synced ? 'on' : ''}`}
+            title={synced ? 'Messages are saved to the Talk channel and continue after the call' : 'Messages last for this call only'}
+          >
+            <span className="chat-sync-dot" aria-hidden />
+            {synced ? 'Synced to Talk' : 'Ephemeral'}
+          </span>
+        </div>
         <button type="button" className="icon-btn" aria-label="Close chat" onClick={onClose}>
           <CloseIcon width={18} height={18} />
         </button>

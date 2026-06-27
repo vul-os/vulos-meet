@@ -13,6 +13,10 @@
 //   ?server=<wss url>              override the LiveKit signal URL
 //   ?name=<display name>           prefill the display name
 //   ?demo=<scene>                  offline demo mode (no SFU / no media)
+//   ?talkChannel=<id>              bind in-call chat to a Talk channel (persistent)
+//   ?talkBase=<url>                Talk API base URL for that channel
+//   ?talkToken=<jwt>               Bearer credential for Talk's message API
+//                                  (alias: ?talkSession=<token>)
 
 /** Derive the LiveKit signal URL from the current origin (ws/wss + same host). */
 export function defaultServerUrl() {
@@ -51,5 +55,23 @@ export function parseConfig(search = window.location.search, pathname = window.l
     displayName: params.get('name') || '',
     demo: params.get('demo') || '',
     separator: params.get('sep') || ':',
+    talkChannel: params.get('talkChannel') || '',
+    talkBase: params.get('talkBase') || '',
+    talkToken: params.get('talkToken') || params.get('talkSession') || '',
+  }
+}
+
+/**
+ * Extract the Talk chat binding from a parsed config, or null when this is a
+ * standalone meeting. A binding needs at least a channel id and a Talk base URL;
+ * the token is optional (Talk may accept unauthenticated reads, or 401 and we
+ * degrade to ephemeral chat).
+ */
+export function talkBinding(config) {
+  if (!config || !config.talkChannel || !config.talkBase) return null
+  return {
+    channelId: config.talkChannel,
+    base: config.talkBase,
+    token: config.talkToken || '',
   }
 }
