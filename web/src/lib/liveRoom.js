@@ -141,8 +141,9 @@ export class LiveRoom {
 
   _onData(payload, participant, topic) {
     // Board traffic rides the same data channel under dedicated topics and is
-    // raw Yjs bytes (NOT JSON) — dispatch it to board listeners and stop.
-    if (topic === 'board' || topic === 'board-ctl') {
+    // raw Yjs/awareness bytes (NOT JSON) — dispatch it to board listeners and
+    // stop so it never reaches chat's JSON parser.
+    if (topic === 'board' || topic === 'board-aware' || topic === 'board-ctl') {
       for (const cb of this.boardListeners) cb(topic, payload)
       return
     }
@@ -163,8 +164,9 @@ export class LiveRoom {
   // ---- whiteboard data channel ----
   // The board panel writes a small Yjs provider on top of these. Board updates
   // are published as raw Uint8Array under a dedicated LiveKit data `topic` so
-  // they never collide with chat's JSON envelope. `topic` is either 'board'
-  // (Yjs document updates / full-state replies) or 'board-ctl' (late-join hello).
+  // they never collide with chat's JSON envelope. `topic` is one of: 'board'
+  // (Yjs document updates / full-state replies), 'board-aware' (awareness /
+  // remote-cursor updates) or 'board-ctl' (late-join hello).
   onBoardData(cb) {
     this.boardListeners.add(cb)
     return () => this.boardListeners.delete(cb)

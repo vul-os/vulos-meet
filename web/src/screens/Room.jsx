@@ -1,11 +1,14 @@
-import { useEffect, useRef, useState } from 'react'
+import { lazy, Suspense, useEffect, useRef, useState } from 'react'
 import VideoGrid from '../components/VideoGrid.jsx'
 import ControlBar from '../components/ControlBar.jsx'
 import ParticipantsPanel from '../components/ParticipantsPanel.jsx'
 import ChatPanel from '../components/ChatPanel.jsx'
 import SettingsPanel from '../components/SettingsPanel.jsx'
-import WhiteboardPanel from '../components/WhiteboardPanel.jsx'
 import { LogoMark } from '../components/Logo.jsx'
+
+// Excalidraw + the Yjs board stack is heavy (~MBs). Load it as a separate async
+// chunk only when the whiteboard is first opened — not on call join.
+const WhiteboardPanel = lazy(() => import('../components/WhiteboardPanel.jsx'))
 
 export default function Room({ snapshot, actions, devices, selectedDevices, onSelectDevice, theme, onTheme }) {
   const [panel, setPanel] = useState(null)
@@ -66,12 +69,20 @@ export default function Room({ snapshot, actions, devices, selectedDevices, onSe
           />
         )}
         {panel === 'whiteboard' && (
-          <WhiteboardPanel
-            user={{ id: snapshot.local.id, name: snapshot.local.name }}
-            roomId={snapshot.room.id || snapshot.room.name}
-            actions={actions}
-            onClose={() => setPanel(null)}
-          />
+          <Suspense
+            fallback={
+              <aside className="panel panel-board" aria-label="Whiteboard" aria-busy="true">
+                <div className="board-loading" role="status">Loading whiteboard…</div>
+              </aside>
+            }
+          >
+            <WhiteboardPanel
+              user={{ id: snapshot.local.id, name: snapshot.local.name }}
+              roomId={snapshot.room.id || snapshot.room.name}
+              actions={actions}
+              onClose={() => setPanel(null)}
+            />
+          </Suspense>
         )}
       </div>
 

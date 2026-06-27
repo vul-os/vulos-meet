@@ -684,6 +684,15 @@ code {
   min-height: 0;
   position: relative;
 }
+/* Shown while the lazy-loaded Excalidraw chunk is fetched on first open. */
+.board-loading {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted, #888);
+  font-size: 14px;
+}
 .panel-head {
   display: flex;
   align-items: center;
