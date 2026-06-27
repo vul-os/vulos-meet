@@ -1157,3 +1157,63 @@ code {
     transition-duration: 0.001ms !important;
   }
 }
+
+/* Apps & Bots management place (/apps). Lightweight chrome around the shared
+   <AppsAndBots/> component (which ships its own styles via @vulos/apps-ui). */
+.apps-view {
+  min-height: 100%;
+  padding: var(--s4, 16px);
+  max-width: 960px;
+  margin: 0 auto;
+}
+.apps-view__bar {
+  display: flex;
+  align-items: center;
+  gap: var(--s3, 12px);
+  margin-bottom: var(--s4, 16px);
+}
+.apps-view__title {
+  font-size: 1.25rem;
+  margin: 0;
+  flex: 1;
+}
+.apps-view__home,
+.apps-view__theme {
+  color: var(--fg-muted, #9aa);
+  text-decoration: none;
+  background: none;
+  border: 1px solid var(--border, #333);
+  border-radius: 8px;
+  padding: 6px 10px;
+  cursor: pointer;
+  font: inherit;
+}
+.apps-view__auth {
+  display: flex;
+  align-items: center;
+  gap: var(--s2, 8px);
+  flex-wrap: wrap;
+  margin-bottom: var(--s4, 16px);
+}
+.apps-view__auth input {
+  flex: 1;
+  min-width: 220px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border, #333);
+  background: var(--bg-elev, #1a1a1a);
+  color: inherit;
+  font: inherit;
+}
+.apps-view__auth button {
+  padding: 8px 14px;
+  border-radius: 8px;
+  border: 1px solid var(--border, #333);
+  background: var(--accent, #3b82f6);
+  color: #fff;
+  cursor: pointer;
+  font: inherit;
+}
+.apps-view__hint {
+  color: var(--fg-muted, #9aa);
+}

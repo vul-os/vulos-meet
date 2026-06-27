@@ -24,12 +24,24 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/vul-os/vulos-apps/appsplatform"
 	"github.com/vul-os/vulos-meet/internal/cp"
 	"github.com/vul-os/vulos-meet/internal/wrap"
 	"github.com/vul-os/vulos-meet/web"
 )
 
 const version = "0.0.1-dev"
+
+// Apps & Bots place env knobs (open-core seam).
+//
+//	appsDBEnv       — path to the standalone SQLite registry; empty = in-memory.
+//	appsCloudURLEnv — selects a Vulos Cloud control-plane registry. This binary
+//	                  ships standalone-only, so setting it is a hard error rather
+//	                  than a silent downgrade.
+const (
+	appsDBEnv       = "MEET_APPS_DB"
+	appsCloudURLEnv = "MEET_APPS_CLOUD_URL"
+)
 
 func main() {
 	var (
@@ -196,6 +208,40 @@ func run(configPath, adminAddrOverride, metricsAddrOverride string) error {
 	// Expose the live participant-minute accrual on the admin stats read.
 	admin.SetUsageStatter(usageRx)
 
+	// Apps & Bots place (shared @vulos/apps platform). The registry is the
+	// open-core seam: the STANDALONE DEFAULT (pure-Go SQLite, durable when
+	// MEET_APPS_DB names a file, else in-memory) ships in this binary; a Vulos
+	// Cloud control-plane registry implements the SAME appsplatform.Registry in
+	// a separate package this core never compiles in. Selecting it is explicit
+	// and env-gated here in the composition root — the OSS binary refuses to
+	// silently downgrade a cloud request to standalone.
+	if os.Getenv(appsCloudURLEnv) != "" {
+		return fmt.Errorf("vulos-meet: %s is set but this build has no cloud apps control-plane registry compiled in (standalone-only)", appsCloudURLEnv)
+	}
+	var appsReg appsplatform.Registry
+	if dsn := os.Getenv(appsDBEnv); dsn != "" {
+		r, err := appsplatform.NewStandaloneRegistry(dsn, appsplatform.WithScopeSet(wrap.MeetAppScopeSet()))
+		if err != nil {
+			return fmt.Errorf("vulos-meet: open apps registry: %w", err)
+		}
+		defer r.Close()
+		appsReg = r
+		log.Printf("vulos-meet: apps & bots place ENABLED (durable registry at %s)", dsn)
+	} else {
+		appsReg = appsplatform.NewMemoryRegistry(appsplatform.WithScopeSet(wrap.MeetAppScopeSet()))
+		log.Printf("vulos-meet: apps & bots place ENABLED (in-memory registry; set %s for durability)", appsDBEnv)
+	}
+	// The adapter acts/reads through the SAME RoomService the admin surface uses
+	// (no new SFU dependency), and the management API reuses the admin bearer.
+	appsHandler, err := wrap.NewAppsHandler(wrap.AppsConfig{
+		Registry:   appsReg,
+		SFU:        rooms,
+		AdminToken: cfg.Admin.Token,
+	})
+	if err != nil {
+		return err
+	}
+
 	// Retention cleanup driver. The blob deleter is the genuinely-external seam:
 	// when recording.cloud_delete_base_url is set, deletions are dispatched to
 	// the vulos-cloud MEET-RECORDING-01 sink (the blob owner); otherwise the
@@ -260,6 +306,14 @@ func run(configPath, adminAddrOverride, metricsAddrOverride string) error {
 	siblingMux := http.NewServeMux()
 	siblingMux.Handle(wrap.WebhookPath, egressRx.Handler())
 	siblingMux.Handle(wrap.UsageWebhookPath, usageRx.Handler())
+	// Apps & Bots place: GET /api/apps (the consolidation contract Workspace
+	// reads) plus the runtime (Bearer app-token) and incoming-webhook routes.
+	// Registered as exact + subtree patterns so they take precedence over the
+	// "/" web-client catch-all; the signal-gate still owns /rtc + egress and
+	// strips its headers on those proxied paths only. Management routes reuse the
+	// admin bearer; runtime routes authenticate with per-app tokens.
+	siblingMux.Handle(appsHandler.BasePath, appsHandler)
+	siblingMux.Handle(appsHandler.BasePath+"/", appsHandler)
 	// Embedded meeting/call web client. Served at the root of the public
 	// signal-gate listener (the same origin as /rtc), so opening the meet
 	// service in a browser yields the join UI and the LiveKit client SDK

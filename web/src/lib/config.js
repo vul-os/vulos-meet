@@ -35,11 +35,16 @@ export function parseConfig(search = window.location.search, pathname = window.l
   // Deep-link room id from the path: /<roomId> (ignore known asset roots).
   let pathRoom = ''
   const seg = decodeURIComponent(pathname.replace(/^\/+/, '').split('/')[0] || '')
-  const reserved = new Set(['index.html', 'assets', 'favicon.svg'])
+  const reserved = new Set(['index.html', 'assets', 'favicon.svg', 'apps'])
   if (seg && !reserved.has(seg) && !seg.includes('.')) pathRoom = seg
+
+  // The Apps & Bots management view: /apps or ?view=apps. It is a separate
+  // surface from the call UI (a different concern: operator-managed apps & bots).
+  const view = seg === 'apps' || params.get('view') === 'apps' ? 'apps' : 'call'
 
   const room = params.get('room') || pathRoom || ''
   return {
+    view,
     room,
     token: params.get('token') || '',
     serverUrl: params.get('server') || defaultServerUrl(),

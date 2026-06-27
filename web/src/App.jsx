@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState, useCallback } from 'react'
 import PreJoin from './screens/PreJoin.jsx'
 import Room from './screens/Room.jsx'
+import AppsAndBotsView from './screens/AppsAndBotsView.jsx'
 import StatusScreen from './components/StatusScreen.jsx'
 import { parseConfig, roomDisplayName } from './lib/config.js'
 import { useRoom } from './lib/useRoom.js'
@@ -67,6 +68,12 @@ export default function App() {
   }, [])
 
   // ---- render ----
+  // Apps & Bots management place (/apps or ?view=apps) — a separate surface
+  // from the call UI, over the shared @vulos/apps platform at /api/apps.
+  if (config.view === 'apps') {
+    return <AppsAndBotsView theme={theme} onTheme={setTheme} />
+  }
+
   if (phase === 'prejoin') {
     return <PreJoin config={config} onJoin={handleJoin} />
   }

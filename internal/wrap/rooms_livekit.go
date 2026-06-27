@@ -207,6 +207,90 @@ func (l *LiveKitRoomService) ListRoomParticipants(ctx context.Context) ([]RoomPa
 	return out, nil
 }
 
+// ParticipantMeta is one room participant's metadata, as reported by LiveKit's
+// ListParticipants. It is the read surface the Apps & Bots place exposes to an
+// app (GET /api/apps/v1/read?kind=participants) — identity/name/join time, never
+// media bytes. Deliberately narrow: an app reads who is in a room, nothing more.
+type ParticipantMeta struct {
+	Identity    string `json:"identity"`
+	Name        string `json:"name"`
+	State       string `json:"state"`
+	JoinedAt    int64  `json:"joined_at"`
+	IsPublisher bool   `json:"is_publisher"`
+}
+
+// ListParticipants returns the roster (identity/name/join time) for a single
+// room. Requires a RoomAdmin grant scoped to that room, minted per-call like the
+// other RoomService methods. Used by the Apps & Bots adapter's Read path.
+func (l *LiveKitRoomService) ListParticipants(ctx context.Context, roomID string) ([]ParticipantMeta, error) {
+	if roomID == "" {
+		return nil, errors.New("vulos-meet: empty room id")
+	}
+	l.requestsTotal.Add(1)
+	if err := l.preCall(); err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(ctx, l.cfg.CallTimeout)
+	defer cancel()
+	authCtx, err := l.authCtx(ctx, &auth.VideoGrant{RoomAdmin: true, Room: roomID})
+	if err != nil {
+		l.postCall(err)
+		return nil, err
+	}
+	resp, err := l.client.ListParticipants(authCtx, &livekit.ListParticipantsRequest{Room: roomID})
+	l.postCall(err)
+	if err != nil {
+		return nil, fmt.Errorf("vulos-meet: livekit ListParticipants: %w", err)
+	}
+	out := make([]ParticipantMeta, 0, len(resp.Participants))
+	for _, p := range resp.Participants {
+		out = append(out, ParticipantMeta{
+			Identity:    p.Identity,
+			Name:        p.Name,
+			State:       p.State.String(),
+			JoinedAt:    p.JoinedAt,
+			IsPublisher: p.IsPublisher,
+		})
+	}
+	return out, nil
+}
+
+// SendData broadcasts an opaque data packet to participants in a room over
+// LiveKit's data channel (the same transport the in-call whiteboard uses). It is
+// the write path the Apps & Bots adapter uses for an app to broadcast an event /
+// notification into a live room. topic is optional (the data-channel topic).
+// Requires a RoomAdmin grant scoped to that room.
+func (l *LiveKitRoomService) SendData(ctx context.Context, roomID string, data []byte, topic string) error {
+	if roomID == "" {
+		return errors.New("vulos-meet: empty room id")
+	}
+	l.requestsTotal.Add(1)
+	if err := l.preCall(); err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(ctx, l.cfg.CallTimeout)
+	defer cancel()
+	authCtx, err := l.authCtx(ctx, &auth.VideoGrant{RoomAdmin: true, Room: roomID})
+	if err != nil {
+		l.postCall(err)
+		return err
+	}
+	req := &livekit.SendDataRequest{
+		Room: roomID,
+		Data: data,
+		Kind: livekit.DataPacket_RELIABLE,
+	}
+	if topic != "" {
+		req.Topic = &topic
+	}
+	_, err = l.client.SendData(authCtx, req)
+	l.postCall(err)
+	if err != nil {
+		return fmt.Errorf("vulos-meet: livekit SendData: %w", err)
+	}
+	return nil
+}
+
 // DeleteRoom removes a room. Returns nil on success regardless of whether
 // the room existed (LiveKit's RoomService semantics — idempotent delete).
 func (l *LiveKitRoomService) DeleteRoom(ctx context.Context, roomID string) error {

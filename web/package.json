@@ -13,6 +13,7 @@
     "mint-dev-token": "node scripts/mint-dev-token.mjs"
   },
   "dependencies": {
+    "@vulos/apps-ui": "file:../../vulos-apps/ui",
     "@vulos/board-ui": "file:../../board-ui",
     "livekit-client": "^2.7.0",
     "react": "^18.3.1",
