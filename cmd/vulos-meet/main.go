@@ -26,6 +26,7 @@ import (
 
 	"github.com/vul-os/vulos-meet/internal/cp"
 	"github.com/vul-os/vulos-meet/internal/wrap"
+	"github.com/vul-os/vulos-meet/web"
 )
 
 const version = "0.0.1-dev"
@@ -259,6 +260,13 @@ func run(configPath, adminAddrOverride, metricsAddrOverride string) error {
 	siblingMux := http.NewServeMux()
 	siblingMux.Handle(wrap.WebhookPath, egressRx.Handler())
 	siblingMux.Handle(wrap.UsageWebhookPath, usageRx.Handler())
+	// Embedded meeting/call web client. Served at the root of the public
+	// signal-gate listener (the same origin as /rtc), so opening the meet
+	// service in a browser yields the join UI and the LiveKit client SDK
+	// connects back to /rtc on this very origin. SPA fallback handles
+	// deep links (/<roomId>). The webhook paths above are registered as
+	// exact subtrees and take precedence over this "/" catch-all.
+	siblingMux.Handle("/", web.Handler())
 
 	// Signaling gate (reverse proxy in front of /rtc).
 	signalSrv := &http.Server{

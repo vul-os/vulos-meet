@@ -1,0 +1,114 @@
+/*
+ * Vulos Meet — OSS-native theme tokens.
+ * Mirrors the VulOS operating-system palette (near-black, mono-led, restrained)
+ * verbatim from the OSS src/index.css, per vulos-cloud/DESIGN_OSS_NATIVE.md.
+ * Pages/components consume tokens ONLY — no hardcoded hex in the call chrome.
+ */
+
+:root,
+[data-theme='dark'] {
+  /* Accent — user-themeable in the OS; blue-500 default. */
+  --accent: #3b82f6;
+  --accent-hover: color-mix(in srgb, var(--accent) 80%, black);
+  --accent-soft: color-mix(in srgb, var(--accent) 16%, transparent);
+
+  /* Brand reservoir — the Vula purple. Used sparingly for emphasis. */
+  --brand: #c96aff;
+  --brand-soft: color-mix(in srgb, var(--brand) 18%, transparent);
+
+  /* Surfaces. */
+  --bg-base: #0c0c0c;
+  --bg-surface: #111111;
+  --bg-elevated: #1a1a1a;
+  --bg-hover: #1e1e1e;
+  --bg-selected: #1a1a2e;
+  --bg-selected-border: #1e1e3a;
+
+  /* Borders. */
+  --border-subtle: #111;
+  --border-default: #1a1a1a;
+  --border-strong: #222;
+  --border-emphasis: #333;
+
+  /* Text. */
+  --text-primary: #e5e5e5;
+  --text-secondary: #ccc;
+  --text-tertiary: #999;
+  --text-muted: #888;
+  --text-faint: #666;
+  --text-ghost: #555;
+  --text-dim: #444;
+  --text-invisible: #333;
+
+  /* Status. */
+  --ok: #3fb950;
+  --warn: #d29922;
+  --danger: #f85149;
+  --danger-hover: color-mix(in srgb, var(--danger) 82%, black);
+  --speaking: #3fb950;
+
+  /* Fonts. */
+  --font-mono: ui-monospace, 'SF Mono', 'Cascadia Code', 'Fira Code', 'Roboto Mono', monospace;
+  --font-sans: 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
+
+  /* Spacing scale. */
+  --s1: 4px;
+  --s2: 8px;
+  --s3: 12px;
+  --s4: 16px;
+  --s5: 24px;
+  --s6: 32px;
+  --s7: 48px;
+
+  /* Radius. */
+  --r1: 6px;
+  --r2: 10px;
+  --r3: 14px;
+  --r-pill: 999px;
+
+  /* Motion. */
+  --ease: cubic-bezier(0.22, 0.61, 0.36, 1);
+  --dur-1: 140ms;
+  --dur-2: 240ms;
+
+  --shadow-1: 0 1px 0 rgba(0, 0, 0, 0.4);
+  --shadow-2: 0 8px 30px rgba(0, 0, 0, 0.45);
+}
+
+[data-theme='light'] {
+  --accent: #3b82f6;
+  --accent-hover: color-mix(in srgb, var(--accent) 85%, white);
+  --accent-soft: color-mix(in srgb, var(--accent) 14%, transparent);
+  --brand: #9333ea;
+  --brand-soft: color-mix(in srgb, var(--brand) 14%, transparent);
+
+  --bg-base: #f5f5f4;
+  --bg-surface: #ffffff;
+  --bg-elevated: #ffffff;
+  --bg-hover: #f0f0ef;
+  --bg-selected: #eef2ff;
+  --bg-selected-border: #dbe2ff;
+
+  --border-subtle: #ececec;
+  --border-default: #e2e2e2;
+  --border-strong: #d6d6d6;
+  --border-emphasis: #c4c4c4;
+
+  --text-primary: #161616;
+  --text-secondary: #2c2c2c;
+  --text-tertiary: #555;
+  --text-muted: #6a6a6a;
+  --text-faint: #888;
+  --text-ghost: #999;
+  --text-dim: #aaa;
+  --text-invisible: #ccc;
+
+  --shadow-2: 0 8px 30px rgba(0, 0, 0, 0.12);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --dur-1: 0ms;
+    --dur-2: 0ms;
+  }
+}

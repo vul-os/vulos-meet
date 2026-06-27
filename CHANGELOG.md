@@ -11,6 +11,21 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Added
 
+- **First-party web client (embedded).** A Vite + React (JSX) meeting/call UI
+  built on the `livekit-client` SDK and themed on the VulOS OSS-native palette,
+  living in [`web/`](web/) and embedded into the binary via `//go:embed`
+  ([`web/embed.go`](web/embed.go)). Served at the root of the public signal-gate
+  listener (same origin as `/rtc`), so opening the service in a browser gives a
+  complete meeting experience. Screens: pre-join lobby (camera/mic preview,
+  device pickers, room/link parsing), in-room grid with active-speaker/presenter
+  focus, control bar (mic, camera, screen-share, raise-hand, leave), participant
+  + chat side panels, and full connecting/reconnecting/ended/permission/error
+  states. Responsive to 360px, a11y- and reduced-motion-aware. The client
+  *consumes* a `VULOS-MEET/1` token (deep link `/<roomId>?token=…`); it never
+  mints — a `mint-dev-token` helper exists for local dev only. A built-in demo
+  mode (`?demo=<scene>`) seeds a fake room for the Playwright screenshotter
+  ([`web/scripts/screenshots.mjs`](web/scripts/screenshots.mjs)) with no SFU,
+  network, or media devices. README gains a Screenshots gallery.
 - **Unified storage seam (OS gateway → egress).** When the Vulos OS gateway
   injects per-request `X-Vulos-Storage-*` headers, the egress proxy rewrites
   `Start*Egress` requests so recording/egress artifacts land in the shared

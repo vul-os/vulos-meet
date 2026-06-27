@@ -45,7 +45,7 @@ the sole LiveKit-talking surface.
 
 | Listener | Default | Scope | Purpose |
 |---|---|---|---|
-| signal-gate | `127.0.0.1:7883` | **public** | `/rtc` WS + `/twirp/livekit.Egress/*` + LiveKit webhooks |
+| signal-gate | `127.0.0.1:7883` | **public** | `/rtc` WS + `/twirp/livekit.Egress/*` + LiveKit webhooks + embedded web client (`/`) |
 | admin | `:7881` | private | `/admin/*` (bearer-token guarded, tenant-scoped) |
 | metrics | `127.0.0.1:7882` | loopback | `/metrics` (Prometheus text) |
 | livekit-server | `127.0.0.1:7880` | loopback only | the supervised SFU (signaling + Twirp) |
