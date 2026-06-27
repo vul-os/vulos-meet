@@ -244,15 +244,19 @@ child on shutdown. It opens four listeners:
 ### Admin surface
 
 ```
-GET    /admin/health                              # status, version, region, protocol (unauthenticated — georoute probe)
+GET    /admin/health                              # minimal liveness only: 200 {"status":"ok"} (unauthenticated)
+GET    /admin/info                                # status, version, region, protocol, separator (admin-token)
 GET    /admin/tenants/{tenant}/rooms              # list a tenant's rooms
 DELETE /admin/tenants/{tenant}/rooms/{room}       # delete a room within a tenant
 GET    /admin/tenants/{tenant}/usage              # live participant-minute accrual
 ```
 
-All but `/admin/health` require `Authorization: Bearer <admin-token>`
-(constant-time compared) **and** pass through the tenant gate before reaching
-LiveKit.
+Only `/admin/health` is unauthenticated, and it discloses nothing beyond
+liveness. Everything else requires `Authorization: Bearer <admin-token>`
+(constant-time compared); the `/admin/tenants/*` routes additionally pass
+through the tenant gate before reaching LiveKit. Build/region detail (used by
+the vulos-cloud georoute probe) moved from the public health response to the
+admin-token-gated `/admin/info`.
 
 **Fly.io (UDP media).** A per-region [`fly.toml`](fly.toml) and a dedicated
 Redis [`fly-redis.toml`](fly-redis.toml) template are included. WebRTC media is

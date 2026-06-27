@@ -108,8 +108,8 @@ func TestAdmin_HealthExposesRegionAndProto(t *testing.T) {
 	srv := httptest.NewServer(admin.Handler())
 	defer srv.Close()
 
-	// Health does NOT require the admin token (it is used for georoute
-	// liveness polling by vulos-cloud).
+	// Public health does NOT require the admin token, but it is minimal: a 200
+	// + {"status":"ok"} and NOTHING that fingerprints the box.
 	resp, err := http.Get(srv.URL + "/admin/health")
 	if err != nil {
 		t.Fatalf("get: %v", err)
@@ -118,8 +118,29 @@ func TestAdmin_HealthExposesRegionAndProto(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status: got %d, want 200", resp.StatusCode)
 	}
+	pubBody, _ := readAll(resp.Body)
+	for _, leak := range []string{"region", "protocol", "version", "separator", "za-jhb"} {
+		if strings.Contains(string(pubBody), leak) {
+			t.Fatalf("public health leaked %q: %s", leak, pubBody)
+		}
+	}
+	if !strings.Contains(string(pubBody), `"status":"ok"`) {
+		t.Fatalf("public health missing status ok: %s", pubBody)
+	}
+
+	// Build/region detail moved behind the admin token at /admin/info.
+	req, _ := http.NewRequest("GET", srv.URL+"/admin/info", nil)
+	req.Header.Set("Authorization", "Bearer supersecrettoken")
+	resp2, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("get info: %v", err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("info status: got %d, want 200", resp2.StatusCode)
+	}
 	var h AdminHealth
-	if err := json.NewDecoder(resp.Body).Decode(&h); err != nil {
+	if err := json.NewDecoder(resp2.Body).Decode(&h); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
 	if h.Region != "za-jhb" {
@@ -130,6 +151,24 @@ func TestAdmin_HealthExposesRegionAndProto(t *testing.T) {
 	}
 	if h.Status != "ok" {
 		t.Fatalf("status: got %q, want ok", h.Status)
+	}
+}
+
+// TestAdmin_InfoRequiresAdminToken locks that the build/region detail endpoint
+// is NOT anonymously readable — that was the whole point of moving it off the
+// public health probe.
+func TestAdmin_InfoRequiresAdminToken(t *testing.T) {
+	admin, _ := newTestAdminServer(t)
+	srv := httptest.NewServer(admin.Handler())
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/admin/info")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated /admin/info: got %d, want 401", resp.StatusCode)
 	}
 }
 
@@ -267,20 +306,23 @@ func equalStrings(a, b []string) bool {
 	return true
 }
 
-// Sanity check we haven't broken JSON contracts.
-func TestAdmin_HealthSeparatorByteIsExposed(t *testing.T) {
+// Sanity check we haven't broken JSON contracts: the separator byte is still
+// exposed, but only on the authenticated /admin/info endpoint.
+func TestAdmin_InfoSeparatorByteIsExposed(t *testing.T) {
 	admin, _ := newTestAdminServer(t)
 	srv := httptest.NewServer(admin.Handler())
 	defer srv.Close()
 
-	resp, err := http.Get(srv.URL + "/admin/health")
+	req, _ := http.NewRequest("GET", srv.URL+"/admin/info", nil)
+	req.Header.Set("Authorization", "Bearer supersecrettoken")
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
 	defer resp.Body.Close()
 	body, _ := readAll(resp.Body)
 	if !strings.Contains(string(body), `"separator":":"`) {
-		t.Fatalf("health did not expose separator byte: %s", body)
+		t.Fatalf("info did not expose separator byte: %s", body)
 	}
 }
 

@@ -28,9 +28,19 @@ type RoomService interface {
 	DeleteRoom(ctx context.Context, roomID string) error
 }
 
-// AdminHealth is the JSON shape returned by GET /admin/health. The
-// vulos-cloud georoute layer (CLOUD-REGION-01) polls this to discover which
-// regions a tenant can be steered to.
+// AdminLiveness is the minimal, UNAUTHENTICATED response from GET
+// /admin/health. It is deliberately just a 200 + {"status":"ok"} so the public
+// liveness probe discloses nothing about build/version/region/topology to
+// unauthenticated callers. Anything an attacker could fingerprint the box with
+// (version, region, protocol, tenant separator) moved to GET /admin/info,
+// behind the admin token.
+type AdminLiveness struct {
+	Status string `json:"status"` // "ok" while we are accepting traffic
+}
+
+// AdminHealth is the JSON shape returned by GET /admin/info. That endpoint is
+// admin-token gated. The vulos-cloud georoute layer (CLOUD-REGION-01) polls it
+// (with the admin bearer) to discover which regions a tenant can be steered to.
 type AdminHealth struct {
 	Status    string `json:"status"`    // "ok" while we are accepting traffic
 	Version   string `json:"version"`   // build version of this binary
@@ -111,6 +121,7 @@ func (s *AdminServer) SetUsageStatter(u UsageStatter) {
 func (s *AdminServer) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /admin/health", s.handleHealth)
+	mux.HandleFunc("GET /admin/info", s.guarded(s.handleInfo))
 	mux.HandleFunc("GET /admin/tenants/{tenant}/rooms", s.guardedTenant(s.handleListRooms))
 	mux.HandleFunc("DELETE /admin/tenants/{tenant}/rooms/{room}", s.guardedTenant(s.handleDeleteRoom))
 	mux.HandleFunc("GET /admin/tenants/{tenant}/usage", s.guardedTenant(s.handleUsage))
@@ -121,6 +132,19 @@ func (s *AdminServer) Handler() http.Handler {
 // validation. The tenant path segment is parsed once and stashed on the
 // request so the inner handler does not re-validate.
 type tenantHandler func(w http.ResponseWriter, r *http.Request, tenant string)
+
+// guarded wraps a handler with admin-token auth only (no tenant-path
+// validation). Used for admin endpoints that are not scoped to a single tenant,
+// such as GET /admin/info.
+func (s *AdminServer) guarded(inner http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !s.checkAdminToken(r) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		inner(w, r)
+	}
+}
 
 func (s *AdminServer) guardedTenant(inner tenantHandler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -175,7 +199,18 @@ func padTo(b []byte, n int) []byte {
 	return out
 }
 
+// handleHealth is the UNAUTHENTICATED liveness probe. It returns a bare 200 +
+// {"status":"ok"} and nothing else: build/version/region/protocol/separator are
+// deliberately withheld from anonymous callers (see handleInfo).
 func (s *AdminServer) handleHealth(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, AdminLiveness{Status: "ok"})
+}
+
+// handleInfo is the admin-token-gated build/region detail endpoint. The
+// vulos-cloud georoute layer polls this (with the admin bearer) to learn the
+// box region/protocol; it carries the fields that used to leak from the public
+// health probe.
+func (s *AdminServer) handleInfo(w http.ResponseWriter, r *http.Request) {
 	resp := AdminHealth{
 		Status:    "ok",
 		Version:   s.version,

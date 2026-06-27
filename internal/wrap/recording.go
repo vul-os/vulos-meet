@@ -98,6 +98,13 @@ func NewEgressReceiver(cfg EgressReceiverConfig) (*EgressReceiver, error) {
 	if cfg.APIKey == "" || cfg.APISecret == "" {
 		return nil, errors.New("vulos-meet: egress receiver requires api_key/api_secret")
 	}
+	// Fail closed: if cloud forwarding is configured (recording.egress_endpoint)
+	// we MUST have a bearer for it. Emitting recording envelopes to the cloud
+	// sink with no Authorization is never acceptable, so refuse to start rather
+	// than push unauthenticated traffic.
+	if cfg.CloudURL != "" && cfg.CloudAuthTok == "" {
+		return nil, errors.New("vulos-meet: cloud egress forwarding is configured (recording.egress_endpoint) but no auth token is set (MEET_RECORDING_CLOUD_TOKEN); refusing to forward recordings unauthenticated")
+	}
 	if cfg.MaxAttempts == 0 {
 		cfg.MaxAttempts = 4
 	}
@@ -377,9 +384,10 @@ func (r *EgressReceiver) forward(ctx context.Context, env *VulosEgressEnvelope) 
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("X-Vulos-Schema", env.Schema)
 		req.Header.Set("X-Vulos-Tenant", env.Tenant)
-		if r.cfg.CloudAuthTok != "" {
-			req.Header.Set("Authorization", "Bearer "+r.cfg.CloudAuthTok)
-		}
+		// Auth is mandatory on the forward leg. NewEgressReceiver fails closed
+		// when CloudURL is set without a token, and forward only runs when
+		// CloudURL is set, so the token is always present here.
+		req.Header.Set("Authorization", "Bearer "+r.cfg.CloudAuthTok)
 		resp, err := r.httpc.Do(req)
 		if err != nil {
 			lastErr = err

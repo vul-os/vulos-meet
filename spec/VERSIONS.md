@@ -13,7 +13,7 @@ VULOS-MEET/1
 ```
 
 - **Wire identifier:** the ASCII string `VULOS-MEET/1`. It is the value of the
-  `protocol` field returned by `GET /admin/health` and the value `vulos-meet`
+  `protocol` field returned by `GET /admin/info` and the value `vulos-meet`
   expects when validating a token's Vulos profile.
 - **Status:** STABLE. Implementations claiming Vulos Meet compatibility MUST
   implement `VULOS-MEET/1` exactly as specified.

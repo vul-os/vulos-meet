@@ -74,6 +74,12 @@ func NewCloudBlobDeleter(baseURL, authTok string, httpc *http.Client) (*CloudBlo
 	if baseURL == "" {
 		return nil, errors.New("vulos-meet: cloud blob deleter requires a base url")
 	}
+	// Fail closed: a configured cloud delete endpoint MUST carry a bearer. We
+	// never issue DELETEs to the cloud sink without Authorization, so refuse to
+	// construct the deleter rather than emit unauthenticated delete requests.
+	if authTok == "" {
+		return nil, errors.New("vulos-meet: cloud blob deleter is configured (recording.cloud_delete_base_url) but no auth token is set (MEET_RECORDING_CLOUD_TOKEN); refusing to issue unauthenticated deletes")
+	}
 	if httpc == nil {
 		httpc = &http.Client{Timeout: 10 * time.Second}
 	}
@@ -104,9 +110,9 @@ func (d *CloudBlobDeleter) Delete(ctx context.Context, r Recording) error {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Vulos-Schema", CloudDeleteSchema)
 	req.Header.Set("X-Vulos-Tenant", r.Tenant)
-	if d.authTok != "" {
-		req.Header.Set("Authorization", "Bearer "+d.authTok)
-	}
+	// Auth is mandatory: NewCloudBlobDeleter fails closed without a token, so
+	// authTok is always non-empty here.
+	req.Header.Set("Authorization", "Bearer "+d.authTok)
 	resp, err := d.httpc.Do(req)
 	if err != nil {
 		return err

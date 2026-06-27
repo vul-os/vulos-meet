@@ -318,7 +318,7 @@ func TestCloudBlobDeleter_404IsSuccess(t *testing.T) {
 		w.WriteHeader(http.StatusNotFound)
 	}))
 	defer srv.Close()
-	d, _ := NewCloudBlobDeleter(srv.URL, "", nil)
+	d, _ := NewCloudBlobDeleter(srv.URL, "tok", nil)
 	if err := d.Delete(context.Background(), Recording{EgressID: "EG_gone"}); err != nil {
 		t.Fatalf("404 must be idempotent success, got %v", err)
 	}
@@ -329,7 +329,7 @@ func TestCloudBlobDeleter_5xxIsError(t *testing.T) {
 		w.WriteHeader(http.StatusBadGateway)
 	}))
 	defer srv.Close()
-	d, _ := NewCloudBlobDeleter(srv.URL, "", nil)
+	d, _ := NewCloudBlobDeleter(srv.URL, "tok", nil)
 	if err := d.Delete(context.Background(), Recording{EgressID: "EG_x"}); err == nil {
 		t.Fatalf("5xx must surface as error so the driver retries")
 	}
