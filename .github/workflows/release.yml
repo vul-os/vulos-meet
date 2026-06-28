@@ -1,0 +1,59 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run tests
+        run: go test -short ./...
+
+      - name: Verify tag matches declared version
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          go build -ldflags "-X main.Version=${VERSION}" -o /tmp/vulos-meet-check ./cmd/vulos-meet
+          BIN_VER=$(/tmp/vulos-meet-check -version | awk '{print $2}')
+          if [ "${BIN_VER}" != "${VERSION}" ]; then
+            echo "ERROR: binary reports version '${BIN_VER}' but tag is '${TAG}'"
+            exit 1
+          fi
+          echo "Version check passed: ${VERSION}"
+
+      - name: Build release binaries
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          LDFLAGS="-s -w -X main.Version=${VERSION}"
+          mkdir -p builds
+
+          GOOS=linux GOARCH=amd64 go build -ldflags "${LDFLAGS}" -o "builds/vulos-meet_${VERSION}_linux_amd64" ./cmd/vulos-meet
+          GOOS=linux GOARCH=arm64 go build -ldflags "${LDFLAGS}" -o "builds/vulos-meet_${VERSION}_linux_arm64" ./cmd/vulos-meet
+          GOOS=darwin GOARCH=amd64 go build -ldflags "${LDFLAGS}" -o "builds/vulos-meet_${VERSION}_darwin_amd64" ./cmd/vulos-meet
+          GOOS=darwin GOARCH=arm64 go build -ldflags "${LDFLAGS}" -o "builds/vulos-meet_${VERSION}_darwin_arm64" ./cmd/vulos-meet
+
+          # Source archive
+          git archive --format=zip HEAD -o "builds/vulos-meet_${VERSION}_source.zip"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: builds/*
+          generate_release_notes: true

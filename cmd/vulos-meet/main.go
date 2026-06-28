@@ -30,7 +30,9 @@ import (
 	"github.com/vul-os/vulos-meet/web"
 )
 
-const version = "0.0.1-dev"
+// Version is set at build time via -ldflags "-X main.Version=vX.Y.Z".
+// It defaults to "dev" for local builds.
+var Version = "dev"
 
 // Apps & Bots place env knobs (open-core seam).
 //
@@ -58,7 +60,7 @@ func main() {
 	flag.Parse()
 
 	if *showVersion {
-		fmt.Println("vulos-meet", version)
+		fmt.Println("vulos-meet", Version)
 		return
 	}
 
@@ -105,7 +107,7 @@ func run(configPath, adminAddrOverride, metricsAddrOverride string) error {
 		return err
 	}
 
-	admin, err := wrap.NewAdminServer(tenant, rooms, geo, cfg.Admin.Token, version)
+	admin, err := wrap.NewAdminServer(tenant, rooms, geo, cfg.Admin.Token, Version)
 	if err != nil {
 		return err
 	}
@@ -344,7 +346,7 @@ func run(configPath, adminAddrOverride, metricsAddrOverride string) error {
 	// checks that probe the same port clients connect on. Distinct from
 	// GET /admin/health (admin listener only; no version) and GET /admin/info
 	// (admin listener, version but admin-token-gated).
-	siblingMux.Handle("GET /healthz", wrap.NewHealthzHandler(version))
+	siblingMux.Handle("GET /healthz", wrap.NewHealthzHandler(Version))
 	siblingMux.Handle(wrap.WebhookPath, egressRx.Handler())
 	siblingMux.Handle(wrap.UsageWebhookPath, usageRx.Handler())
 	// Apps & Bots place: GET /api/apps (the consolidation contract Workspace
