@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/vul-os/vulos-apps/appsplatform"
+	"github.com/vul-os/vulos-meet/internal/apikey"
 	"github.com/vul-os/vulos-meet/internal/cp"
 	"github.com/vul-os/vulos-meet/internal/wrap"
 	"github.com/vul-os/vulos-meet/web"
@@ -117,6 +118,20 @@ func run(configPath, adminAddrOverride, metricsAddrOverride string) error {
 	// admin bearer token and accidental rapid-fire scripting.
 	adminLimiter := wrap.NewRateLimiter(2, 5, 10*time.Minute)
 	admin.SetRateLimiter(adminLimiter)
+
+	// vk_ API-key introspection seam. When VULOS_CP_BASE_URL is set, the admin
+	// API also accepts `Authorization: Bearer vk_…` keys issued by the Vulos
+	// control plane alongside the existing MEET_ADMIN_TOKEN bearer. The key is
+	// validated via POST {VULOS_CP_BASE_URL}/api/keys/introspect; it must be
+	// valid and carry the "meet" product scope. Results are cached ~60s.
+	// When VULOS_CP_BASE_URL is unset (self-host / standalone) this seam is OFF
+	// and the admin API is unchanged — only the static MEET_ADMIN_TOKEN applies.
+	if apikeyIntro := apikey.NewIntrospector(apikey.FromEnv()); apikeyIntro != nil {
+		admin.SetIntrospector(apikeyIntro)
+		log.Printf("vulos-meet: vk_ API-key auth ENABLED on admin API (VULOS_CP_BASE_URL set)")
+	} else {
+		log.Printf("vulos-meet: vk_ API-key auth disabled on admin API (VULOS_CP_BASE_URL unset — standalone)")
+	}
 
 	// Surface the configured room ceilings on the metrics surface so a scrape
 	// can correlate active rooms against the per-room participant cap and the

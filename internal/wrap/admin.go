@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/vul-os/vulos-meet/internal/apikey"
 )
 
 // AdminTokenEnv is the environment variable that carries the bearer token
@@ -59,9 +61,10 @@ type AdminServer struct {
 	geo         *GeoRouter
 	adminToken  string
 	version     string
-	metrics     *Metrics     // optional — nil disables metrics emission
-	usage       UsageStatter // optional — nil disables the usage stats read
-	rateLimiter *RateLimiter // optional — nil disables per-IP rate limiting
+	metrics     *Metrics            // optional — nil disables metrics emission
+	usage       UsageStatter        // optional — nil disables the usage stats read
+	rateLimiter *RateLimiter        // optional — nil disables per-IP rate limiting
+	intro       apikey.Introspector // optional — nil disables vk_ key path (VULOS_CP_BASE_URL unset)
 }
 
 // UsageStatter is the read-only seam the admin surface uses to expose live
@@ -121,6 +124,17 @@ func (s *AdminServer) SetRateLimiter(r *RateLimiter) {
 	s.rateLimiter = r
 }
 
+// SetIntrospector wires the vk_ API-key introspection seam. When non-nil,
+// an `Authorization: Bearer vk_…` credential is validated via the Vulos
+// control-plane introspection endpoint (POST {VULOS_CP_BASE_URL}/api/keys/introspect)
+// on every guarded admin route. The key must be valid and carry the "meet"
+// product scope. When nil (VULOS_CP_BASE_URL unset) the vk_ path is disabled
+// and all guarded routes require the static MEET_ADMIN_TOKEN — self-host is
+// unchanged. Passing nil clears a previously wired introspector.
+func (s *AdminServer) SetIntrospector(intro apikey.Introspector) {
+	s.intro = intro
+}
+
 // Handler returns the http.Handler registering all /admin routes. The router
 // is kept in this method (not as a free function) so callers can mount the
 // admin surface under a sub-path if they want.
@@ -141,28 +155,28 @@ func (s *AdminServer) Handler() http.Handler {
 	return h
 }
 
-// guardedTenant wraps a handler with admin-token auth + tenant-path
-// validation. The tenant path segment is parsed once and stashed on the
-// request so the inner handler does not re-validate.
+// tenantHandler is the inner callback type for tenant-scoped admin routes.
 type tenantHandler func(w http.ResponseWriter, r *http.Request, tenant string)
 
-// guarded wraps a handler with admin-token auth only (no tenant-path
-// validation). Used for admin endpoints that are not scoped to a single tenant,
-// such as GET /admin/info.
+// guarded wraps a handler with admin auth only (no tenant-path validation).
+// Used for admin endpoints not scoped to a single tenant, such as GET /admin/info.
+// Auth accepts EITHER a vk_ API key (when VULOS_CP_BASE_URL is set) OR the
+// static MEET_ADMIN_TOKEN bearer — vk_ prefix selects the scheme.
 func (s *AdminServer) guarded(inner http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !s.checkAdminToken(r) {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
+		if !s.checkAuth(w, r) {
 			return
 		}
 		inner(w, r)
 	}
 }
 
+// guardedTenant wraps a handler with admin auth + tenant-path validation.
+// Auth accepts EITHER a vk_ API key (when VULOS_CP_BASE_URL is set) OR the
+// static MEET_ADMIN_TOKEN bearer — vk_ prefix selects the scheme.
 func (s *AdminServer) guardedTenant(inner tenantHandler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !s.checkAdminToken(r) {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
+		if !s.checkAuth(w, r) {
 			return
 		}
 		tenant := r.PathValue("tenant")
@@ -174,18 +188,69 @@ func (s *AdminServer) guardedTenant(inner tenantHandler) http.HandlerFunc {
 	}
 }
 
-// checkAdminToken pulls the bearer from Authorization and constant-time
-// compares it to the configured admin token. Constant-time compare is the
-// difference between "we have an auth token" and "an attacker can side-channel
-// the token byte-by-byte".
-func (s *AdminServer) checkAdminToken(r *http.Request) bool {
+// checkAuth authenticates an admin request, writing the error response itself
+// and returning false when auth fails. It accepts two schemes:
+//
+//  1. vk_ API key — `Authorization: Bearer vk_…` — validated via the CP
+//     introspection seam (apikey.Introspector). The key must be valid and carry
+//     the "meet" product scope. Only attempted when an introspector is wired
+//     (VULOS_CP_BASE_URL is set). CP unavailable → 503 (fail-closed).
+//
+//  2. Static admin bearer — `Authorization: Bearer <MEET_ADMIN_TOKEN>` — the
+//     existing constant-time compare path. Used when the token does not start
+//     with the vk_ prefix, or when no introspector is wired.
+//
+// The vk_ prefix is the exclusive selector: a vk_ token is never tried as a
+// static admin token, and a static admin token is never tried as a vk_ key.
+func (s *AdminServer) checkAuth(w http.ResponseWriter, r *http.Request) bool {
+	raw := adminBearerRaw(r)
+
+	// ── vk_ API-key path ─────────────────────────────────────────────────────
+	// Only when an introspector is configured AND the credential looks like a
+	// Vulos API key. A vk_ token is never tried as a static admin token (and
+	// vice versa), so the two schemes can't be confused.
+	if s.intro != nil && strings.HasPrefix(raw, apikey.KeyPrefix) {
+		res, err := s.intro.Introspect(r.Context(), raw)
+		if err != nil {
+			// CP unreachable: fail closed rather than guess.
+			http.Error(w, "API key validation unavailable", http.StatusServiceUnavailable)
+			return false
+		}
+		if !res.Valid {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return false
+		}
+		if !res.HasProduct(apikey.ProductMeet) {
+			http.Error(w, "API key not authorized for the meet product", http.StatusForbidden)
+			return false
+		}
+		return true
+	}
+
+	// ── Static admin-token path ───────────────────────────────────────────────
+	if !constantTimeEqualString(raw, s.adminToken) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return false
+	}
+	return true
+}
+
+// adminBearerRaw returns the raw token from an `Authorization: Bearer <token>`
+// header (no scheme prefix, trimmed), or "" when absent or wrong scheme.
+func adminBearerRaw(r *http.Request) string {
 	h := r.Header.Get("Authorization")
 	const prefix = "Bearer "
 	if !strings.HasPrefix(h, prefix) {
-		return false
+		return ""
 	}
-	got := h[len(prefix):]
-	return constantTimeEqualString(got, s.adminToken)
+	return strings.TrimSpace(h[len(prefix):])
+}
+
+// checkAdminToken pulls the bearer from Authorization and constant-time
+// compares it to the configured admin token. Retained for callers (tests) that
+// use it directly. New code should prefer checkAuth which also handles vk_ keys.
+func (s *AdminServer) checkAdminToken(r *http.Request) bool {
+	return constantTimeEqualString(adminBearerRaw(r), s.adminToken)
 }
 
 // constantTimeEqualString is a length-safe wrapper around
