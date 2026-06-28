@@ -110,6 +110,11 @@ func run(configPath, adminAddrOverride, metricsAddrOverride string) error {
 		return err
 	}
 	admin.SetMetrics(metrics)
+	// Per-IP rate limiter on the admin surface. 5 req/s burst, 2 req/s sustained.
+	// Admin ops are infrequent; rate limiting protects against brute-force on the
+	// admin bearer token and accidental rapid-fire scripting.
+	adminLimiter := wrap.NewRateLimiter(2, 5, 10*time.Minute)
+	admin.SetRateLimiter(adminLimiter)
 
 	// Surface the configured room ceilings on the metrics surface so a scrape
 	// can correlate active rooms against the per-room participant cap and the
@@ -131,6 +136,15 @@ func run(configPath, adminAddrOverride, metricsAddrOverride string) error {
 	if err != nil {
 		return err
 	}
+	// Per-IP token-bucket rate limiter on /rtc. 20 req/s burst, 10 req/s
+	// sustained — generous enough for browsers reconnecting on network changes
+	// (the LiveKit JS SDK reconnects up to ~5× in a short window), strict enough
+	// to blunt a scanner driving the JWT-signature-verify cost. TURN credential
+	// exchange rides the same WebSocket upgrade on /rtc, so this limiter covers
+	// the TURN-credential endpoint too.
+	rtcLimiter := wrap.NewRateLimiter(10, 20, 10*time.Minute)
+	signalGate.SetRateLimiter(rtcLimiter)
+
 	// Enforce the per-box concurrent-room ceiling at the gate. LiveKit's config
 	// has auto_create:true, so a join to a not-yet-existing room would otherwise
 	// create it unbounded; the gate is the reliable enforcement point. A join to
@@ -325,6 +339,12 @@ func run(configPath, adminAddrOverride, metricsAddrOverride string) error {
 	// Each mounts its own distinct path, so a single mux dispatches both without
 	// either shadowing the other.
 	siblingMux := http.NewServeMux()
+	// GET /healthz — unauthenticated liveness + version probe on the PUBLIC
+	// signal-gate listener. Intended for load balancers and container health
+	// checks that probe the same port clients connect on. Distinct from
+	// GET /admin/health (admin listener only; no version) and GET /admin/info
+	// (admin listener, version but admin-token-gated).
+	siblingMux.Handle("GET /healthz", wrap.NewHealthzHandler(version))
 	siblingMux.Handle(wrap.WebhookPath, egressRx.Handler())
 	siblingMux.Handle(wrap.UsageWebhookPath, usageRx.Handler())
 	// Apps & Bots place: GET /api/apps (the consolidation contract Workspace

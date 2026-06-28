@@ -54,13 +54,14 @@ type AdminHealth struct {
 // tenant. Every non-health endpoint goes through both the admin-token gate
 // AND the tenant gate before reaching LiveKit.
 type AdminServer struct {
-	tenant     *Tenant
-	rooms      RoomService
-	geo        *GeoRouter
-	adminToken string
-	version    string
-	metrics    *Metrics     // optional — nil disables metrics emission
-	usage      UsageStatter // optional — nil disables the usage stats read
+	tenant      *Tenant
+	rooms       RoomService
+	geo         *GeoRouter
+	adminToken  string
+	version     string
+	metrics     *Metrics     // optional — nil disables metrics emission
+	usage       UsageStatter // optional — nil disables the usage stats read
+	rateLimiter *RateLimiter // optional — nil disables per-IP rate limiting
 }
 
 // UsageStatter is the read-only seam the admin surface uses to expose live
@@ -112,6 +113,14 @@ func (s *AdminServer) SetUsageStatter(u UsageStatter) {
 	s.usage = u
 }
 
+// SetRateLimiter wires a per-IP token-bucket rate limiter onto ALL admin
+// endpoints (including the unauthenticated health probe). Rate limiting is
+// applied before admin-token verification so a high-rate brute-force attempt
+// does not exhaust CPU on constant-time compare. Passing nil clears the limiter.
+func (s *AdminServer) SetRateLimiter(r *RateLimiter) {
+	s.rateLimiter = r
+}
+
 // Handler returns the http.Handler registering all /admin routes. The router
 // is kept in this method (not as a free function) so callers can mount the
 // admin surface under a sub-path if they want.
@@ -125,7 +134,11 @@ func (s *AdminServer) Handler() http.Handler {
 	mux.HandleFunc("GET /admin/tenants/{tenant}/rooms", s.guardedTenant(s.handleListRooms))
 	mux.HandleFunc("DELETE /admin/tenants/{tenant}/rooms/{room}", s.guardedTenant(s.handleDeleteRoom))
 	mux.HandleFunc("GET /admin/tenants/{tenant}/usage", s.guardedTenant(s.handleUsage))
-	return instrumentAdmin(s.metrics, mux)
+	h := instrumentAdmin(s.metrics, mux)
+	if s.rateLimiter != nil {
+		h = s.rateLimiter.Middleware(h)
+	}
+	return h
 }
 
 // guardedTenant wraps a handler with admin-token auth + tenant-path

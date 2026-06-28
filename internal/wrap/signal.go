@@ -42,6 +42,12 @@ type SignalGate struct {
 	// is never consulted at all when max <= 0 (explicitly unbounded). See
 	// SetRoomCap and enforceRoomCap.
 	roomCap roomCapEnforcer
+
+	// rtcLimiter is the optional per-IP token-bucket rate limiter applied to
+	// every /rtc request BEFORE token validation. Rate-limiting before parsing
+	// prevents a high-rate attacker from abusing the JWT signature-verify cost.
+	// nil disables rate limiting (default — useful in tests / small deployments).
+	rtcLimiter *RateLimiter
 }
 
 // RoomLister is the narrow read-only surface the signal-gate needs to count
@@ -67,6 +73,15 @@ type roomCapEnforcer struct {
 // path, and a stalled list must not hang the join indefinitely. The fail-open
 // vs fail-closed choice on timeout is documented in enforceRoomCap.
 const roomCapListTimeout = 3 * time.Second
+
+// SetRateLimiter wires a per-IP token-bucket rate limiter onto the /rtc
+// endpoint. Rate limiting is applied before token validation to prevent
+// high-frequency callers from abusing the JWT signature-verification cost.
+// Passing nil clears any previously-set limiter. Call once at startup before
+// serving; not safe to call concurrently with serving.
+func (g *SignalGate) SetRateLimiter(r *RateLimiter) {
+	g.rtcLimiter = r
+}
 
 // SetRoomCap wires concurrent-room-ceiling enforcement into the gate. lister is
 // the read-only room counter (the same RoomService the admin surface uses);
@@ -151,6 +166,13 @@ func (g *SignalGate) Handler(siblingHandler http.Handler, egressProxy *EgressPro
 // BEFORE forwarding to livekit-server, so a malformed or cross-tenant token
 // never reaches the SFU.
 func (g *SignalGate) handleRTC(w http.ResponseWriter, r *http.Request) {
+	// Per-IP rate limiting is applied first — before JWT parsing — to prevent
+	// a high-rate scanner from abusing the signature-verification CPU cost.
+	// A throttled caller gets HTTP 429; token contents are never inspected.
+	if g.rtcLimiter != nil && !g.rtcLimiter.Allow(clientIP(r)) {
+		http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+		return
+	}
 	raw := extractTokenFromRequest(r)
 	if raw == "" {
 		// No token at all — fail closed.

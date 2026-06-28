@@ -134,13 +134,22 @@ func (t *Tenant) FilterRooms(wantTenant string, roomIDs []string) []string {
 	return out
 }
 
-// validateTenant enforces the tenant-ID character set. We deliberately keep
-// the rule strict: ASCII letters, digits, hyphen, underscore. No dots (those
-// invite confusion with DNS names that may or may not be tenants); no
-// separator byte (would corrupt the prefix invariant); no whitespace.
+// MaxTenantIDLen is the maximum allowed length (in bytes) of a tenant
+// identifier. 63 mirrors the DNS label limit and is a practical upper bound
+// for any real tenant slug; longer values are rejected as malformed to prevent
+// DoS via unbounded path parameters.
+const MaxTenantIDLen = 63
+
+// validateTenant enforces the tenant-ID character set and length. We
+// deliberately keep the rule strict: ASCII letters, digits, hyphen, underscore
+// only. No dots (invite confusion with DNS names); no separator byte (would
+// corrupt the prefix invariant); no whitespace; length ≤ MaxTenantIDLen.
 func (t *Tenant) validateTenant(tenant string) error {
 	if tenant == "" {
 		return ErrEmptyTenant
+	}
+	if len(tenant) > MaxTenantIDLen {
+		return ErrInvalidTenant
 	}
 	for i := 0; i < len(tenant); i++ {
 		c := tenant[i]
