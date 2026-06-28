@@ -11,28 +11,20 @@ cloud service is required — and is surfaced inside the suite by Vulos Workspac
 
 ## Overview
 
-```
-                 LiveKit client SDK (browser / mobile / native)
-                        │  token (minted upstream — VULOS-MEET/1)
-                        ▼
-        ┌──────────────────────────────────────────────┐
-        │                 vulos-meet                     │
-        │                                                │
-        │  signal-gate  ──/rtc (WS)──────────┐           │   admin  :7881   (token-guarded)
-        │  (public)     ──/twirp/Egress/*──┐ │           │   metrics:7882   (loopback)
-        │   • validate VULOS-MEET/1 token  │ │           │
-        │   • tenant binding + room cap    │ │           │
-        │   • egress RoomRecord authz      │ │           │
-        │   • webhook receiver (metering)  │ │           │
-        └──────────────────────────────────┼─┼───────────┘
-                                            │ │  supervises (child process)
-                                            ▼ ▼
-                              ┌──────────────────────────┐
-                              │   livekit-server (SFU)   │  ◀── UDP media (clients)
-                              │   bound to loopback      │
-                              └──────────────────────────┘
-                                            │
-                              Redis (cascading-SFU discovery, optional)
+```mermaid
+flowchart TD
+    Client["LiveKit client SDK (browser / mobile / native)"]
+    Client -->|"token (minted upstream — VULOS-MEET/1)"| Gate
+    Client -->|"UDP media (clients)"| SFU
+
+    subgraph meet["vulos-meet"]
+        Gate["signal-gate (public): /rtc (WS) + /twirp/Egress/*<br>• validate VULOS-MEET/1 token<br>• tenant binding + room cap<br>• egress RoomRecord authz<br>• webhook receiver (metering)"]
+        Admin["admin :7881 (token-guarded)"]
+        Metrics["metrics :7882 (loopback)"]
+    end
+
+    Gate -->|"supervises (child process)"| SFU["livekit-server (SFU) bound to loopback"]
+    SFU --> Redis["Redis (cascading-SFU discovery, optional)"]
 ```
 
 The SFU child is bound to **loopback only**; it is reachable exclusively through

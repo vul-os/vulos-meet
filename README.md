@@ -368,27 +368,20 @@ npm --prefix web run mint-dev-token -- \
 
 ## Architecture
 
-```
-                 LiveKit client SDK (browser / mobile / native)
-                        │  token (minted upstream — VULOS-MEET/1)
-                        ▼
-        ┌──────────────────────────────────────────────┐
-        │                 vulos-meet                     │
-        │                                                │
-        │  signal-gate  ──/rtc (WS)──────────┐           │   admin  :7881   (token-guarded)
-        │  (public)     ──/twirp/Egress/*──┐ │           │   metrics:7882   (loopback)
-        │   • validate VULOS-MEET/1 token  │ │           │
-        │   • tenant binding + room cap    │ │           │
-        │   • egress RoomRecord authz      │ │           │
-        └──────────────────────────────────┼─┼───────────┘
-                                            │ │  supervises (child process)
-                                            ▼ ▼
-                              ┌──────────────────────────┐
-                              │   livekit-server (SFU)   │  ◀── UDP media (clients)
-                              │   bound to loopback      │
-                              └──────────────────────────┘
-                                            │
-                              Redis (cascading-SFU discovery, optional)
+```mermaid
+flowchart TD
+    Client["LiveKit client SDK (browser / mobile / native)"]
+    Client -->|"token (minted upstream — VULOS-MEET/1)"| Gate
+    Client -->|"UDP media (clients)"| SFU
+
+    subgraph meet["vulos-meet"]
+        Gate["signal-gate (public): /rtc (WS) + /twirp/Egress/*<br>• validate VULOS-MEET/1 token<br>• tenant binding + room cap<br>• egress RoomRecord authz"]
+        Admin["admin :7881 (token-guarded)"]
+        Metrics["metrics :7882 (loopback)"]
+    end
+
+    Gate -->|"supervises (child process)"| SFU["livekit-server (SFU) bound to loopback"]
+    SFU --> Redis["Redis (cascading-SFU discovery, optional)"]
 ```
 
 **Why supervise instead of embed?** `github.com/livekit/livekit-server` pulls a
