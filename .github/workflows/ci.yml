@@ -41,6 +41,12 @@ jobs:
       - name: Checkout sibling board-ui
         run: git clone --depth 1 https://github.com/vul-os/board-ui ../board-ui
 
+      - name: Install and build sibling vulos-apps/ui
+        run: cd ../vulos-apps/ui && npm install
+
+      - name: Install and build sibling board-ui
+        run: cd ../board-ui && npm install
+
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
