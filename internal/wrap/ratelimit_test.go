@@ -236,8 +236,9 @@ func TestRateLimiter_Middleware_Throttles(t *testing.T) {
 	}
 }
 
-// TestRateLimiter_Middleware_XFFPreferred verifies that the rate limiter keys
-// on the X-Forwarded-For client IP, not the proxy's TCP address.
+// TestRateLimiter_Middleware_XFFPreferred verifies that when XFF trust is
+// enabled the rate limiter keys on the X-Forwarded-For client IP rather than
+// the proxy's TCP address.
 func TestRateLimiter_Middleware_XFFPreferred(t *testing.T) {
 	now, _ := newTestClock(time.Unix(1_000, 0))
 	rl := newRateLimiterWithClock(1, 2, time.Minute, now)
@@ -245,7 +246,8 @@ func TestRateLimiter_Middleware_XFFPreferred(t *testing.T) {
 	inner := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
-	h := rl.Middleware(inner)
+	// Use MiddlewareWithTrust(true) to enable XFF for this test.
+	h := rl.MiddlewareWithTrust(inner, true)
 
 	// Two requests from the SAME proxy (RemoteAddr) but DIFFERENT XFF client IPs.
 	for i, xff := range []string{"203.0.113.1", "203.0.113.2"} {
@@ -272,14 +274,16 @@ func TestRateLimiter_Middleware_XFFPreferred(t *testing.T) {
 	}
 }
 
-// TestRateLimiter_Middleware_XFFChainTakesFirst verifies comma-separated
-// X-Forwarded-For uses the leftmost (client) entry as the rate-limiter key.
+// TestRateLimiter_Middleware_XFFChainTakesFirst verifies that when XFF trust
+// is enabled, a comma-separated X-Forwarded-For uses the leftmost (client)
+// entry as the rate-limiter key.
 func TestRateLimiter_Middleware_XFFChainTakesFirst(t *testing.T) {
 	now, _ := newTestClock(time.Unix(1_000, 0))
 	rl := newRateLimiterWithClock(0.001, 1, time.Minute, now) // burst=1 so second request throttles
 
 	inner := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
-	h := rl.Middleware(inner)
+	// Use MiddlewareWithTrust(true) to enable XFF for this test.
+	h := rl.MiddlewareWithTrust(inner, true)
 
 	mkReq := func() *http.Request {
 		req := httptest.NewRequest("GET", "/", nil)
@@ -303,8 +307,13 @@ func TestRateLimiter_Middleware_XFFChainTakesFirst(t *testing.T) {
 // TestRateLimiter_SignalGate_ThrottlesHighFrequencyClient verifies that the
 // signal gate's /rtc endpoint returns 429 when the per-IP rate limiter is
 // exhausted, and that the upstream LiveKit is never reached for the throttled
-// request.
+// request. XFF trust is enabled (MEET_TRUSTED_PROXY=1) so the limiter keys
+// on the client IP passed in X-Forwarded-For.
 func TestRateLimiter_SignalGate_ThrottlesHighFrequencyClient(t *testing.T) {
+	// Enable XFF trust so the rate limiter keys on the XFF client IP rather
+	// than the loopback TCP addr (which changes per-connection in httptest).
+	t.Setenv(TrustedProxyEnv, "1")
+
 	f := &fakeLiveKitSignal{}
 	upstream := newFakeLiveKitSignal(t, f)
 	defer upstream.Close()
@@ -347,7 +356,12 @@ func TestRateLimiter_SignalGate_ThrottlesHighFrequencyClient(t *testing.T) {
 
 // TestRateLimiter_AdminServer_ThrottlesHighFrequency verifies the admin
 // server's rate limiter returns 429 when the per-IP bucket is exhausted.
+// XFF trust is enabled so the limiter keys on the client IP in the header.
 func TestRateLimiter_AdminServer_ThrottlesHighFrequency(t *testing.T) {
+	// Enable XFF trust so the rate limiter sees the client IP from XFF
+	// rather than the loopback TCP address (which varies per-connection).
+	t.Setenv(TrustedProxyEnv, "1")
+
 	admin, rooms := newTestAdminServer(t)
 	ctx := context.Background()
 	rooms.CreateRoom(ctx, "acme:standup")
@@ -376,6 +390,43 @@ func TestRateLimiter_AdminServer_ThrottlesHighFrequency(t *testing.T) {
 	}
 	if code := do("10.0.0.5"); code != http.StatusTooManyRequests {
 		t.Fatalf("throttled request: got %d want 429", code)
+	}
+}
+
+// TestRateLimiter_XFFUntrustedDefaultPreventsRotation verifies that when XFF
+// trust is OFF (the default) a client cannot bypass the rate limiter by rotating
+// its X-Forwarded-For header — the limiter keys on RemoteAddr instead.
+func TestRateLimiter_XFFUntrustedDefaultPreventsRotation(t *testing.T) {
+	// Ensure TrustedProxyEnv is absent for this test (default = off).
+	t.Setenv(TrustedProxyEnv, "")
+
+	now, _ := newTestClock(time.Unix(1_000, 0))
+	rl := newRateLimiterWithClock(0.001, 1, time.Minute, now) // burst=1
+
+	inner := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	h := rl.Middleware(inner) // XFF trust determined by env (off)
+
+	// First request from a stable RemoteAddr: allowed.
+	req1 := httptest.NewRequest("GET", "/", nil)
+	req1.RemoteAddr = "198.51.100.5:12345"
+	req1.Header.Set("X-Forwarded-For", "10.0.0.1") // claimed client IP
+	rw := httptest.NewRecorder()
+	h.ServeHTTP(rw, req1)
+	if rw.Code != http.StatusOK {
+		t.Fatalf("first request: got %d want 200", rw.Code)
+	}
+
+	// Second request from the SAME RemoteAddr but a DIFFERENT XFF header:
+	// without XFF trust the limiter still sees the same RemoteAddr bucket → 429.
+	req2 := httptest.NewRequest("GET", "/", nil)
+	req2.RemoteAddr = "198.51.100.5:12345"
+	req2.Header.Set("X-Forwarded-For", "10.0.0.99") // rotated XFF — must be ignored
+	rw2 := httptest.NewRecorder()
+	h.ServeHTTP(rw2, req2)
+	if rw2.Code != http.StatusTooManyRequests {
+		t.Fatalf("rotated-XFF bypass attempt: got %d want 429 (XFF must be ignored when MEET_TRUSTED_PROXY is off)", rw2.Code)
 	}
 }
 

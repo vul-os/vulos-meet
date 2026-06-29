@@ -97,7 +97,7 @@ admin:
 	if !reflect.DeepEqual(c.Media.SimulcastLayers, []string{"180p", "360p", "720p"}) {
 		t.Fatalf("simulcast default: got %v", c.Media.SimulcastLayers)
 	}
-	if c.LiveKit.SignalingAddr != ":7880" || c.Admin.Addr != ":7881" {
+	if c.LiveKit.SignalingAddr != ":7880" || c.Admin.Addr != "127.0.0.1:7881" {
 		t.Fatalf("addr defaults: got signaling=%q admin=%q", c.LiveKit.SignalingAddr, c.Admin.Addr)
 	}
 }

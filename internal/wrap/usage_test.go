@@ -302,3 +302,33 @@ func TestUsage_RequiresInputs(t *testing.T) {
 		t.Fatalf("expected error with no api creds")
 	}
 }
+
+// TestUsage_OversizedBodyRejected verifies that a POST body larger than 1 MiB
+// is rejected (413 or a non-204 status) WITHOUT reading the full body into
+// memory. The key invariant: the handler must not buffer multi-GB bodies from
+// unauthenticated callers before reaching the signature check.
+func TestUsage_OversizedBodyRejected(t *testing.T) {
+	rx := newUsageReceiverForTest(t, nil, nil)
+	srv := httptest.NewServer(rx.Handler())
+	defer srv.Close()
+
+	// 1 MiB + 1 byte — just over the cap.
+	oversized := make([]byte, (1<<20)+1)
+	// Sign the oversized body so the signature check would pass if the body
+	// were accepted — that way a non-4xx response would be a true bug.
+	tok := signLiveKitWebhook(t, oversized)
+	req, _ := http.NewRequest("POST", srv.URL+UsageWebhookPath, bytes.NewReader(oversized))
+	req.Header.Set("Authorization", tok)
+	req.Header.Set("Content-Type", "application/webhook+json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+	// Must NOT succeed — 413 Request Entity Too Large is the canonical status,
+	// but the underlying library may surface this as 400 or 401 depending on
+	// where the read is cut off. Any non-204 status is acceptable.
+	if resp.StatusCode == http.StatusNoContent {
+		t.Fatalf("oversized body was accepted (204); expected rejection")
+	}
+}

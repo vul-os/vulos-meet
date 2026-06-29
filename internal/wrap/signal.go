@@ -169,7 +169,7 @@ func (g *SignalGate) handleRTC(w http.ResponseWriter, r *http.Request) {
 	// Per-IP rate limiting is applied first — before JWT parsing — to prevent
 	// a high-rate scanner from abusing the signature-verification CPU cost.
 	// A throttled caller gets HTTP 429; token contents are never inspected.
-	if g.rtcLimiter != nil && !g.rtcLimiter.Allow(clientIP(r)) {
+	if g.rtcLimiter != nil && !g.rtcLimiter.Allow(clientIP(r, isTrustedProxy())) {
 		http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
 		return
 	}

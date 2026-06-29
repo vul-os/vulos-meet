@@ -20,6 +20,11 @@ import (
 // "open admin" mode.
 const AdminTokenEnv = "MEET_ADMIN_TOKEN"
 
+// AdminAddrEnv overrides the admin listener bind address at runtime so
+// operators can move it without editing the config file. Defaults (in
+// config.go applyDefaults) to "127.0.0.1:7881" (loopback-only).
+const AdminAddrEnv = "MEET_ADMIN_ADDR"
+
 // RoomService is the narrow interface admin handlers use to reach LiveKit's
 // RoomService. In production this is backed by livekit/protocol's
 // RoomServiceClient; in tests we substitute an in-memory fake. Keeping the

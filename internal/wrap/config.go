@@ -312,6 +312,9 @@ func (c *Config) applyEnv() {
 	if v := os.Getenv(AdminTokenEnv); v != "" {
 		c.Admin.Token = v
 	}
+	if v := os.Getenv(AdminAddrEnv); v != "" {
+		c.Admin.Addr = v
+	}
 	if v := os.Getenv(ClusterRedisPasswordEnv); v != "" {
 		c.Cluster.Redis.Password = v
 	}
@@ -368,7 +371,10 @@ func (c *Config) applyDefaults() {
 		c.Room.MaxRooms = DefaultMaxRooms
 	}
 	if c.Admin.Addr == "" {
-		c.Admin.Addr = ":7881"
+		// Default to loopback: the admin surface is private; binding to all
+		// interfaces is a footgun on boxes with a public NIC. Operators can
+		// override via the -addr flag or MEET_ADMIN_ADDR env.
+		c.Admin.Addr = "127.0.0.1:7881"
 	}
 	// Cluster.Region is a mirror of the box region; if the operator sets it
 	// in YAML we silently overwrite to keep the cluster + georoute views

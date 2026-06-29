@@ -6,6 +6,7 @@ package wrap
 import (
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -124,16 +125,33 @@ func (r *RateLimiter) BucketCount() int {
 	return len(r.buckets)
 }
 
+// TrustedProxyEnv is the environment variable that enables X-Forwarded-For
+// trust in the rate-limiter IP extractor. When set to "1", "true", or "yes"
+// (case-insensitive) the limiter keys on the leftmost XFF entry (the
+// client IP as reported by the upstream load balancer). When unset or any
+// other value, the limiter keys on RemoteAddr (the TCP peer address) to
+// prevent rate-limit bypass on a directly-exposed box where XFF can be
+// spoofed by clients. Default: off (safe for direct-internet exposure).
+const TrustedProxyEnv = "MEET_TRUSTED_PROXY"
+
 // Middleware returns an http.Handler that applies the rate limiter keyed on
 // the client IP on every request. Throttled requests receive HTTP 429 with no
 // body detail (the exact rate parameters are internal).
 //
-// Client IP extraction trusts X-Forwarded-For (first entry) when present —
-// the signal-gate is expected to sit behind a load balancer or proxy that
-// sets it. Falls back to the TCP RemoteAddr.
+// Client IP extraction honours TrustedProxyEnv: when off (default), the key
+// is the TCP RemoteAddr, which cannot be spoofed. When on (set
+// MEET_TRUSTED_PROXY=1), the leftmost X-Forwarded-For entry is preferred so
+// the limiter sees the real client IP from behind a trusted load balancer.
 func (r *RateLimiter) Middleware(next http.Handler) http.Handler {
+	return r.MiddlewareWithTrust(next, isTrustedProxy())
+}
+
+// MiddlewareWithTrust is the testable variant — it accepts the XFF-trust flag
+// directly rather than reading the environment, so tests can exercise both
+// paths deterministically.
+func (r *RateLimiter) MiddlewareWithTrust(next http.Handler, trustXFF bool) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		if !r.Allow(clientIP(req)) {
+		if !r.Allow(clientIP(req, trustXFF)) {
 			http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
 			return
 		}
@@ -141,23 +159,33 @@ func (r *RateLimiter) Middleware(next http.Handler) http.Handler {
 	})
 }
 
+// isTrustedProxy returns true when MEET_TRUSTED_PROXY is set to a truthy value.
+func isTrustedProxy() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(TrustedProxyEnv))) {
+	case "1", "true", "yes":
+		return true
+	default:
+		return false
+	}
+}
+
 // clientIP returns the best-available client IP string for use as a rate-
-// limiter key. It prefers the first entry in X-Forwarded-For (trusting the
-// upstream proxy chain) and falls back to the raw TCP remote address.
-//
-// Note: X-Forwarded-For can be spoofed by clients if the server is directly
-// exposed. Callers deploying vulos-meet behind an untrusted network should
-// disable XFF trust by wrapping with their own IP extractor.
-func clientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		// May be comma-separated (proxy chain); take the leftmost (client) entry.
-		if i := strings.IndexByte(xff, ','); i > 0 {
-			xff = strings.TrimSpace(xff[:i])
-		} else {
-			xff = strings.TrimSpace(xff)
-		}
-		if ip := net.ParseIP(xff); ip != nil {
-			return ip.String()
+// limiter key. When trustXFF is true, it prefers the first entry in
+// X-Forwarded-For (trusting the upstream proxy chain); when false, it uses
+// the raw TCP remote address only — safe on boxes without a trusted proxy in
+// front, where XFF headers can be injected by clients to rotate the bucket key.
+func clientIP(r *http.Request, trustXFF bool) string {
+	if trustXFF {
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			// May be comma-separated (proxy chain); take the leftmost (client) entry.
+			if i := strings.IndexByte(xff, ','); i > 0 {
+				xff = strings.TrimSpace(xff[:i])
+			} else {
+				xff = strings.TrimSpace(xff)
+			}
+			if ip := net.ParseIP(xff); ip != nil {
+				return ip.String()
+			}
 		}
 	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)

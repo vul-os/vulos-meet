@@ -387,10 +387,16 @@ func run(configPath, adminAddrOverride, metricsAddrOverride string) error {
 	siblingMux.Handle("/", web.Handler())
 
 	// Signaling gate (reverse proxy in front of /rtc).
+	// The public listener rate-limits ALL routes (not just /rtc) to prevent
+	// unauthenticated callers from abusing webhooks, the web root, /api/apps,
+	// or /mcp endpoints. rtcLimiter is already attached to signalGate for /rtc
+	// specifically; wrapping the whole handler here is additive — /rtc passes
+	// the middleware check THEN the per-gate check, which is intentional.
 	signalSrv := &http.Server{
 		Addr:              cfg.SignalGateAddr(),
-		Handler:           signalGate.Handler(siblingMux, egressProxy),
+		Handler:           rtcLimiter.Middleware(signalGate.Handler(siblingMux, egressProxy)),
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
 	}
 	wg.Add(1)
 	go func() {

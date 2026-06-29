@@ -178,6 +178,10 @@ func (u *UsageReceiver) handle(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	// Cap the body BEFORE signature verification so a multi-GB POST from an
+	// unauthenticated caller cannot buffer into memory. 1 MiB matches the
+	// egress_proxy.go cap; any legitimate LiveKit webhook is well under 1 KiB.
+	req.Body = http.MaxBytesReader(w, req.Body, 1<<20)
 	// webhook.Receive verifies the Authorization JWT against our key provider
 	// AND that the body sha256 matches the JWT claim. It closes req.Body.
 	raw, err := webhook.Receive(req, u.keyProv)

@@ -376,5 +376,71 @@ func TestEgress_LifecycleFailedStatus(t *testing.T) {
 	}
 }
 
+// TestEgress_OversizedBodyRejected verifies that a POST body larger than 1 MiB
+// is rejected (non-204) without buffering the full body into memory before the
+// signature check, preventing memory exhaustion from unauthenticated callers.
+func TestEgress_OversizedBodyRejected(t *testing.T) {
+	rx, _, _ := newEgressReceiverForTest(t, "")
+	srv := httptest.NewServer(rx.Handler())
+	defer srv.Close()
+
+	// 1 MiB + 1 byte — just over the cap.
+	oversized := make([]byte, (1<<20)+1)
+	// Sign the oversized body so the signature check would pass if the body
+	// were accepted — that way a non-4xx response indicates a real bug.
+	tok := signLiveKitWebhook(t, oversized)
+	req, _ := http.NewRequest("POST", srv.URL+WebhookPath, bytes.NewReader(oversized))
+	req.Header.Set("Authorization", tok)
+	req.Header.Set("Content-Type", "application/webhook+json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+	// Must NOT succeed (204). Any 4xx is acceptable — the body was capped.
+	if resp.StatusCode == http.StatusNoContent {
+		t.Fatalf("oversized body was accepted (204); expected rejection")
+	}
+}
+
+// TestEgress_RateLimitAppliesToWebhookPath verifies that a rate limiter applied
+// to the full public listener (not just /rtc) also throttles the egress webhook
+// path — ensuring non-/rtc routes are not accidentally left unprotected.
+func TestEgress_RateLimitAppliesToWebhookPath(t *testing.T) {
+	rx, _, _ := newEgressReceiverForTest(t, "")
+
+	// Use MiddlewareWithTrust(false) — RemoteAddr keyed so httptest's loopback
+	// addr is stable within a single persistent connection. We drive requests
+	// through httptest.ResponseRecorder directly (no network) to keep the key
+	// stable across calls.
+	rl := newRateLimiterWithClock(0.001, 1, 10*time.Minute, time.Now) // burst=1
+	handler := rl.MiddlewareWithTrust(rx.Handler(), false)
+
+	body := []byte(`{"event":"egress_started","egress_info":{"egress_id":"EG_RL","room_name":"acme:r"}}`)
+	tok := signLiveKitWebhook(t, body)
+
+	makeReq := func() *http.Request {
+		req := httptest.NewRequest("POST", WebhookPath, bytes.NewReader(body))
+		req.Header.Set("Authorization", tok)
+		req.Header.Set("Content-Type", "application/webhook+json")
+		req.RemoteAddr = "203.0.113.1:12345" // stable key across recorder calls
+		return req
+	}
+
+	// First request: allowed (burst=1).
+	rw := httptest.NewRecorder()
+	handler.ServeHTTP(rw, makeReq())
+	if rw.Code == http.StatusTooManyRequests {
+		t.Fatalf("first request should pass the rate limiter, got 429")
+	}
+
+	// Second request: same IP, burst exhausted → 429.
+	rw = httptest.NewRecorder()
+	handler.ServeHTTP(rw, makeReq())
+	if rw.Code != http.StatusTooManyRequests {
+		t.Fatalf("second request to webhook path should be rate-limited, got %d (want 429)", rw.Code)
+	}
+}
+
 // Avoid unused-context warning when go vet is run during the run.
 var _ = context.Background
