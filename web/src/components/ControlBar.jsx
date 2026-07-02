@@ -12,7 +12,9 @@ import {
   SettingsIcon,
   BoardIcon,
   ChevronDownIcon,
+  SmileIcon,
 } from './Icons.jsx'
+import { ReactionMenu } from './Reactions.jsx'
 
 function ControlButton({ label, active, danger, on = true, badge, onClick, children, extra }) {
   return (
@@ -73,7 +75,17 @@ function DeviceMenu({ devices, onPick, onClose }) {
   )
 }
 
-export default function ControlBar({ local, actions, devices, panel, setPanel, participantCount, unread }) {
+export default function ControlBar({
+  local,
+  actions,
+  devices,
+  panel,
+  setPanel,
+  participantCount,
+  unread,
+  reactionsOpen,
+  setReactionsOpen,
+}) {
   const [menu, setMenu] = useState(false)
 
   return (
@@ -121,6 +133,21 @@ export default function ControlBar({ local, actions, devices, panel, setPanel, p
 
       <ControlButton label={local.handRaised ? 'Lower hand' : 'Raise hand'} active={local.handRaised} onClick={actions.toggleHand}>
         <HandIcon />
+      </ControlButton>
+
+      <ControlButton
+        label="React"
+        active={reactionsOpen}
+        onClick={() => setReactionsOpen((v) => !v)}
+        extra={
+          <ReactionMenu
+            open={reactionsOpen}
+            onClose={() => setReactionsOpen(false)}
+            onPick={(emoji) => actions.sendReaction(emoji)}
+          />
+        }
+      >
+        <SmileIcon />
       </ControlButton>
 
       <div className="ctrl-sep" aria-hidden />

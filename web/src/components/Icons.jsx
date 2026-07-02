@@ -130,6 +130,45 @@ export const ChevronDownIcon = (p) => (
   </svg>
 )
 
+export const PinIcon = (p) => (
+  <svg {...base} {...p}>
+    <path d="M9 3h6l-1 6 3 3v2h-4v5l-1 2-1-2v-5H6v-2l3-3z" />
+  </svg>
+)
+
+export const PinOffIcon = (p) => (
+  <svg {...base} {...p}>
+    <path d="M9 3h6l-1 6 3 3v2h-4v5l-1 2-1-2v-5H6v-2l3-3z" />
+    <path d="M3 3l18 18" />
+  </svg>
+)
+
+export const SmileIcon = (p) => (
+  <svg {...base} {...p}>
+    <circle cx="12" cy="12" r="9" />
+    <path d="M8.5 14a4 4 0 0 0 7 0" />
+    <path d="M9 9.5h.01M15 9.5h.01" />
+  </svg>
+)
+
+// Signal-strength bars. `bars` (0-4) fills that many; the rest render faint.
+export const SignalIcon = ({ bars = 0, ...p }) => (
+  <svg {...base} {...p} strokeWidth={0} fill="none">
+    {[0, 1, 2, 3].map((i) => (
+      <rect
+        key={i}
+        x={3 + i * 5.2}
+        y={16 - i * 4}
+        width="3.4"
+        height={4 + i * 4}
+        rx="1"
+        fill="currentColor"
+        opacity={i < bars ? 1 : 0.22}
+      />
+    ))}
+  </svg>
+)
+
 export const Spinner = (p) => (
   <svg {...base} {...p} className={`spin ${p?.className || ''}`}>
     <path d="M12 3a9 9 0 1 0 9 9" />

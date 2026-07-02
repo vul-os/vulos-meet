@@ -1,4 +1,5 @@
-import { MicIcon, MicOffIcon, CamOffIcon, HandIcon, CloseIcon } from './Icons.jsx'
+import { MicIcon, MicOffIcon, CamOffIcon, HandIcon, CloseIcon, SignalIcon } from './Icons.jsx'
+import { qualityInfo, shouldShowQuality } from '../lib/quality.js'
 
 function initials(name) {
   return (name || '?')
@@ -34,6 +35,11 @@ export default function ParticipantsPanel({ participants, onClose }) {
               {p.isLocal ? ' (you)' : ''}
             </span>
             <span className="picons">
+              {shouldShowQuality(p.quality) && (
+                <span className={`picon ${qualityInfo(p.quality).tone}`} title={qualityInfo(p.quality).label}>
+                  <SignalIcon bars={qualityInfo(p.quality).bars} width={16} height={16} />
+                </span>
+              )}
               {p.handRaised && (
                 <span className="picon hand" title="Hand raised">
                   <HandIcon width={16} height={16} />

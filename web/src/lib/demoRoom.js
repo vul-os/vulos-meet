@@ -7,14 +7,14 @@
 // of a live MediaStreamTrack; VideoTile renders a styled placeholder for it.
 
 const PEOPLE = [
-  { id: 'amara', name: 'Amara Ndlovu', hue: 280, camOn: true, micOn: true, speaking: true },
-  { id: 'sipho', name: 'Sipho Khumalo', hue: 210, camOn: true, micOn: true, speaking: false },
-  { id: 'lena', name: 'Lena Fischer', hue: 150, camOn: false, micOn: false, speaking: false },
-  { id: 'tariq', name: 'Tariq Bashir', hue: 25, camOn: true, micOn: true, speaking: false, handRaised: true },
-  { id: 'mei', name: 'Mei Tanaka', hue: 330, camOn: true, micOn: false, speaking: false },
+  { id: 'amara', name: 'Amara Ndlovu', hue: 280, camOn: true, micOn: true, speaking: true, quality: 'excellent' },
+  { id: 'sipho', name: 'Sipho Khumalo', hue: 210, camOn: true, micOn: true, speaking: false, quality: 'good' },
+  { id: 'lena', name: 'Lena Fischer', hue: 150, camOn: false, micOn: false, speaking: false, quality: 'poor' },
+  { id: 'tariq', name: 'Tariq Bashir', hue: 25, camOn: true, micOn: true, speaking: false, handRaised: true, quality: 'good' },
+  { id: 'mei', name: 'Mei Tanaka', hue: 330, camOn: true, micOn: false, speaking: false, quality: 'excellent' },
 ]
 
-const ME = { id: 'you', name: 'You', hue: 195, camOn: true, micOn: true }
+const ME = { id: 'you', name: 'You', hue: 195, camOn: true, micOn: true, quality: 'excellent' }
 
 const MESSAGES = [
   { from: 'Amara Ndlovu', text: "Morning all — let's keep this to 20 minutes.", min: 6 },
@@ -42,6 +42,7 @@ function buildPeople({ withScreen = false } = {}) {
       screenOn: false,
       speaking: !!p.speaking,
       handRaised: !!p.handRaised,
+      quality: p.quality || 'excellent',
     })
     tiles.push({
       key: `${p.id}:cam`,
@@ -51,6 +52,7 @@ function buildPeople({ withScreen = false } = {}) {
       camOn: !!p.camOn,
       speaking: !!p.speaking,
       handRaised: !!p.handRaised,
+      quality: p.quality || 'excellent',
       kind: 'camera',
       track: p.camOn ? demoTrack('camera', p.hue, p.name) : null,
     })
@@ -95,12 +97,13 @@ export class DemoRoom {
   constructor(scene = 'in-room') {
     this.scene = scene
     this.listeners = new Set()
+    this.reactionListeners = new Set()
     this.state = this._sceneState(scene)
   }
 
   _sceneState(scene) {
     const roomName = 'standup-2026-06-27'
-    const local = { id: ME.id, name: ME.name, micOn: true, camOn: true, screenOn: scene === 'screen-share', handRaised: false }
+    const local = { id: ME.id, name: ME.name, micOn: true, camOn: true, screenOn: scene === 'screen-share', handRaised: false, quality: 'excellent', mutedButTalking: false }
     const messages = demoMessages()
     const chat = { synced: false, label: 'ephemeral' }
 
@@ -173,6 +176,17 @@ export class DemoRoom {
       messages: [...this.state.messages, { id: `s${Date.now()}`, from: 'You', text: t, ts: Date.now(), self: true }],
     }
     this._emit()
+  }
+
+  onReaction(cb) {
+    this.reactionListeners.add(cb)
+    return () => this.reactionListeners.delete(cb)
+  }
+
+  sendReaction(emoji) {
+    const e = String(emoji || '')
+    if (!e) return
+    for (const cb of this.reactionListeners) cb({ from: 'You', emoji: e, id: ME.id, self: true })
   }
 
   // Whiteboard has no peers in the offline demo — board edits stay local.

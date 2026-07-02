@@ -39,4 +39,34 @@ describe('LiveRoom data-channel topic routing', () => {
     expect(() => room._onData(new Uint8Array([0xff, 0x00]), {}, undefined)).not.toThrow()
     expect(room.messages).toHaveLength(0)
   })
+
+  it('routes reaction envelopes to reaction listeners, not chat', () => {
+    const room = new LiveRoom()
+    const seen = []
+    room.onReaction((r) => seen.push(r))
+
+    const react = new TextEncoder().encode(JSON.stringify({ kind: 'reaction', emoji: '🎉' }))
+    room._onData(react, { name: 'Amara', identity: 'a1' }, 'reaction')
+
+    expect(seen).toHaveLength(1)
+    expect(seen[0]).toMatchObject({ emoji: '🎉', from: 'Amara' })
+    expect(room.messages).toHaveLength(0)
+  })
+
+  it('drops empty reactions', () => {
+    const room = new LiveRoom()
+    let hits = 0
+    room.onReaction(() => hits++)
+    room._onData(new TextEncoder().encode(JSON.stringify({ kind: 'reaction', emoji: '' })), {}, 'reaction')
+    expect(hits).toBe(0)
+  })
+
+  it('echoes a locally sent reaction to listeners even with no room', () => {
+    const room = new LiveRoom()
+    const seen = []
+    room.onReaction((r) => seen.push(r))
+    room.sendReaction('👍')
+    expect(seen).toHaveLength(1)
+    expect(seen[0]).toMatchObject({ emoji: '👍', self: true })
+  })
 })

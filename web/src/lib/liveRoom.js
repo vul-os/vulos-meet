@@ -15,9 +15,22 @@ import {
   RoomEvent,
   Track,
   ConnectionState,
+  ConnectionQuality,
   DisconnectReason,
 } from 'livekit-client'
 import { EphemeralChatTransport, createChatTransport } from './chatTransport.js'
+
+// Reactions a participant can fling into the room. Kept small + emoji-only so
+// the payload is trivial and the fly-up overlay stays legible.
+export const REACTIONS = ['👍', '❤️', '😂', '🎉', '👏', '😮', '🙌', '🤔']
+
+function qualityLabel(q) {
+  if (q === ConnectionQuality.Excellent) return 'excellent'
+  if (q === ConnectionQuality.Good) return 'good'
+  if (q === ConnectionQuality.Poor) return 'poor'
+  if (q === ConnectionQuality.Lost) return 'lost'
+  return 'unknown'
+}
 
 export class LiveRoom {
   constructor() {
@@ -29,6 +42,11 @@ export class LiveRoom {
     this.error = null
     this.roomName = ''
     this._audioEls = new Map() // trackSid -> HTMLAudioElement
+    this.reactionListeners = new Set()
+    // Live "you're muted but talking" hint. A local mic-level monitor keeps this
+    // updated while the mic is muted; the UI surfaces a gentle nudge.
+    this.mutedButTalking = false
+    this._micMonitor = null
 
     // In-call chat is delegated to a pluggable ChatTransport. We start on the
     // ephemeral (data-channel) transport so chat works pre-connect and for
@@ -124,6 +142,7 @@ export class LiveRoom {
       .on(RoomEvent.TrackMuted, () => this._emit())
       .on(RoomEvent.TrackUnmuted, () => this._emit())
       .on(RoomEvent.ActiveSpeakersChanged, () => this._emit())
+      .on(RoomEvent.ConnectionQualityChanged, () => this._emit())
       .on(RoomEvent.ParticipantAttributesChanged, () => this._emit())
       .on(RoomEvent.DataReceived, (payload, participant, _kind, topic) => this._onData(payload, participant, topic))
       .on(RoomEvent.ConnectionStateChanged, (s) => this._onConnState(s))
@@ -149,6 +168,7 @@ export class LiveRoom {
       // rather than silently dropping the join.
       if (cam) await room.localParticipant.setCameraEnabled(true).catch((e) => this._mediaErr(e))
       if (mic) await room.localParticipant.setMicrophoneEnabled(true).catch((e) => this._mediaErr(e))
+      this._syncMutedMonitor()
       this._emit()
     } catch (err) {
       this.status = 'error'
@@ -206,6 +226,13 @@ export class LiveRoom {
     }
     try {
       const msg = JSON.parse(new TextDecoder().decode(payload))
+      if (msg.kind === 'reaction') {
+        // Emoji reaction from a peer — fan out to the fly-up overlay only.
+        const from = participant?.name || participant?.identity || 'Guest'
+        const emoji = String(msg.emoji || '')
+        if (emoji) for (const cb of this.reactionListeners) cb({ from, emoji, id: participant?.identity })
+        return
+      }
       if (msg.kind === 'chat') {
         // Hand inbound chat to whatever transport is active. The ephemeral
         // transport ingests it; the Talk transport ignores the data channel
@@ -234,11 +261,93 @@ export class LiveRoom {
     this.room.localParticipant.publishData(bytes, { reliable: true, topic }).catch(() => {})
   }
 
+  // ---- reactions ----
+  onReaction(cb) {
+    this.reactionListeners.add(cb)
+    return () => this.reactionListeners.delete(cb)
+  }
+
+  sendReaction(emoji) {
+    const e = String(emoji || '')
+    if (!e) return
+    // Echo locally so the sender sees their own reaction fly, then broadcast.
+    const from = this.room?.localParticipant?.name || 'You'
+    for (const cb of this.reactionListeners) cb({ from, emoji: e, id: this.room?.localParticipant?.identity, self: true })
+    if (!this.room) return
+    const payload = new TextEncoder().encode(JSON.stringify({ kind: 'reaction', emoji: e }))
+    this.room.localParticipant.publishData(payload, { reliable: false, topic: 'reaction' }).catch(() => {})
+  }
+
+  // ---- muted-but-talking monitor ----
+  // While the mic is muted we still watch its raw level from a local getUserMedia
+  // stream (never published) so we can nudge "you're muted" when the user speaks.
+  // Torn down whenever the mic is live (LiveKit owns the level then) or on leave.
+  async _startMutedMonitor() {
+    if (this._micMonitor || typeof window === 'undefined') return
+    const AC = window.AudioContext || window.webkitAudioContext
+    if (!AC || !navigator.mediaDevices?.getUserMedia) return
+    let stream
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+    } catch {
+      return
+    }
+    const ctx = new AC()
+    const src = ctx.createMediaStreamSource(stream)
+    const analyser = ctx.createAnalyser()
+    analyser.fftSize = 512
+    src.connect(analyser)
+    const data = new Uint8Array(analyser.frequencyBinCount)
+    let hot = 0
+    const tick = () => {
+      if (!this._micMonitor) return
+      analyser.getByteTimeDomainData(data)
+      let peak = 0
+      for (let i = 0; i < data.length; i++) peak = Math.max(peak, Math.abs(data[i] - 128))
+      const talking = peak > 12 // ~0.09 RMS-ish; ignores room noise
+      hot = talking ? Math.min(hot + 1, 6) : Math.max(hot - 1, 0)
+      const next = hot >= 2
+      if (next !== this.mutedButTalking) {
+        this.mutedButTalking = next
+        this._emit()
+      }
+      this._micMonitor.raf = requestAnimationFrame(tick)
+    }
+    this._micMonitor = { stream, ctx, raf: 0 }
+    this._micMonitor.raf = requestAnimationFrame(tick)
+  }
+
+  _stopMutedMonitor() {
+    const m = this._micMonitor
+    this._micMonitor = null
+    if (!m) return
+    cancelAnimationFrame(m.raf)
+    for (const t of m.stream.getTracks()) {
+      try {
+        t.stop()
+      } catch {
+        /* already stopped */
+      }
+    }
+    m.ctx.close?.().catch?.(() => {})
+    if (this.mutedButTalking) {
+      this.mutedButTalking = false
+      this._emit()
+    }
+  }
+
+  _syncMutedMonitor() {
+    const lp = this.room?.localParticipant
+    if (lp && !lp.isMicrophoneEnabled) this._startMutedMonitor()
+    else this._stopMutedMonitor()
+  }
+
   // ---- actions ----
   async toggleMic() {
     const lp = this.room?.localParticipant
     if (!lp) return
     await lp.setMicrophoneEnabled(!lp.isMicrophoneEnabled).catch((e) => this._mediaErr(e))
+    this._syncMutedMonitor()
     this._emit()
   }
 
@@ -277,6 +386,7 @@ export class LiveRoom {
   }
 
   async leave() {
+    this._stopMutedMonitor()
     this.chat?.dispose?.()
     if (this.room) await this.room.disconnect()
     this.status = 'left'
@@ -303,6 +413,7 @@ export class LiveRoom {
       const handRaised = p.attributes?.handRaised === 'true'
       const isSpeaking = speaking.has(p.identity)
       const name = p.name || p.identity || 'Guest'
+      const quality = qualityLabel(p.connectionQuality)
 
       participants.push({
         id: p.identity,
@@ -313,6 +424,7 @@ export class LiveRoom {
         screenOn: !!screenPub && !!screenPub.track,
         speaking: isSpeaking,
         handRaised,
+        quality,
       })
 
       tiles.push({
@@ -323,6 +435,7 @@ export class LiveRoom {
         camOn,
         speaking: isSpeaking,
         handRaised,
+        quality,
         kind: 'camera',
         track: camOn ? camPub.track : null,
       })
@@ -362,6 +475,8 @@ export class LiveRoom {
         camOn: lp.isCameraEnabled,
         screenOn: lp.isScreenShareEnabled,
         handRaised: lp.attributes?.handRaised === 'true',
+        quality: qualityLabel(lp.connectionQuality),
+        mutedButTalking: this.mutedButTalking && !lp.isMicrophoneEnabled,
       },
       messages: this.messages,
       chat: { synced: this._chatSynced, label: this._chatLabel },
@@ -377,7 +492,7 @@ function baseSnapshot(status, error, roomName, messages) {
     tiles: [],
     participants: [],
     presenter: null,
-    local: { id: '', name: 'You', micOn: false, camOn: false, screenOn: false, handRaised: false },
+    local: { id: '', name: 'You', micOn: false, camOn: false, screenOn: false, handRaised: false, quality: 'unknown', mutedButTalking: false },
     messages,
     chat: { synced: false, label: 'ephemeral' },
   }

@@ -40,6 +40,25 @@ describe('DemoRoom', () => {
     expect(localTile.micOn).toBe(!before)
   })
 
+  it('carries a connection-quality label on every participant', () => {
+    const r = new DemoRoom('in-room')
+    let snap
+    r.on((s) => (snap = s))
+    expect(snap.participants.every((p) => typeof p.quality === 'string')).toBe(true)
+    expect(snap.local.quality).toBeTruthy()
+  })
+
+  it('echoes a locally sent reaction to onReaction listeners', () => {
+    const r = new DemoRoom('in-room')
+    const seen = []
+    r.onReaction((x) => seen.push(x))
+    r.sendReaction('🎉')
+    expect(seen).toHaveLength(1)
+    expect(seen[0]).toMatchObject({ emoji: '🎉', self: true })
+    r.sendReaction('')
+    expect(seen).toHaveLength(1) // empty dropped
+  })
+
   it('appends sent chat messages', () => {
     const r = new DemoRoom('in-room')
     let snap

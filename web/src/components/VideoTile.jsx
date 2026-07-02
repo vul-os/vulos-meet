@@ -1,5 +1,6 @@
 import { useEffect, useRef } from 'react'
-import { MicOffIcon, HandIcon } from './Icons.jsx'
+import { MicOffIcon, HandIcon, SignalIcon, PinIcon, PinOffIcon } from './Icons.jsx'
+import { qualityInfo, shouldShowQuality } from '../lib/quality.js'
 
 function initials(name) {
   return (name || '?')
@@ -49,9 +50,10 @@ function DemoSurface({ track }) {
   )
 }
 
-export default function VideoTile({ tile, focus = false }) {
+export default function VideoTile({ tile, focus = false, pinned = false, onTogglePin }) {
   const ref = useRef(null)
   const track = tile.track
+  const q = qualityInfo(tile.quality)
 
   useEffect(() => {
     const el = ref.current
@@ -96,16 +98,36 @@ export default function VideoTile({ tile, focus = false }) {
         </div>
       )}
 
+      {onTogglePin && (
+        <button
+          type="button"
+          className={`tile-pin ${pinned ? 'on' : ''}`}
+          aria-pressed={pinned}
+          aria-label={pinned ? `Unpin ${tile.name}` : `Pin ${tile.name}`}
+          title={pinned ? 'Unpin' : 'Pin'}
+          onClick={onTogglePin}
+        >
+          {pinned ? <PinOffIcon width={15} height={15} /> : <PinIcon width={15} height={15} />}
+        </button>
+      )}
+
       <div className="tile-footer">
         <span className="tile-name">
           {tile.name}
           {tile.isLocal && tile.kind === 'camera' ? ' (you)' : ''}
         </span>
-        {tile.kind === 'camera' && !tile.micOn && (
-          <span className="tile-muted" title="Muted">
-            <MicOffIcon width={15} height={15} />
-          </span>
-        )}
+        <span className="tile-badges">
+          {tile.kind === 'camera' && shouldShowQuality(tile.quality) && (
+            <span className={`tile-signal ${q.tone}`} title={q.label} aria-label={q.label}>
+              <SignalIcon bars={q.bars} width={15} height={15} />
+            </span>
+          )}
+          {tile.kind === 'camera' && !tile.micOn && (
+            <span className="tile-muted" title="Muted">
+              <MicOffIcon width={15} height={15} />
+            </span>
+          )}
+        </span>
       </div>
     </div>
   )

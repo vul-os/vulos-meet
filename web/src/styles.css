@@ -1246,3 +1246,232 @@ code {
 .apps-view__hint {
   color: var(--fg-muted, #9aa);
 }
+
+/* ---------- tile badges: connection quality + pin ---------- */
+.tile-badges {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+.tile-signal {
+  display: inline-flex;
+}
+.tile-signal.ok {
+  color: var(--ok);
+}
+.tile-signal.warn {
+  color: var(--warn);
+}
+.tile-signal.danger {
+  color: var(--danger);
+}
+.tile-signal.muted {
+  color: var(--text-faint);
+}
+
+.tile-pin {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  border-radius: var(--r1);
+  border: 1px solid var(--border-emphasis);
+  background: color-mix(in srgb, var(--bg-base) 55%, transparent);
+  color: var(--text-secondary);
+  opacity: 0;
+  transition: opacity var(--dur-1) var(--ease), background var(--dur-1) var(--ease), color var(--dur-1) var(--ease);
+}
+.tile:hover .tile-pin,
+.tile:focus-within .tile-pin,
+.tile-pin.on {
+  opacity: 1;
+}
+.tile-pin:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+.tile-pin.on {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+@media (hover: none) {
+  .tile-pin {
+    opacity: 1;
+  }
+}
+
+/* participants-panel quality tones reuse .picon */
+.picon.ok {
+  color: var(--ok);
+}
+.picon.warn {
+  color: var(--warn);
+}
+.picon.danger {
+  color: var(--danger);
+}
+.picon.muted {
+  color: var(--text-faint);
+}
+
+/* ---------- reactions ---------- */
+.reactions-overlay {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  overflow: hidden;
+  z-index: 5;
+}
+.reaction-fly {
+  position: absolute;
+  bottom: 8%;
+  font-size: 34px;
+  line-height: 1;
+  animation: reaction-rise 2.6s var(--ease) forwards;
+  will-change: transform, opacity;
+  filter: drop-shadow(0 2px 6px rgba(0, 0, 0, 0.4));
+}
+@keyframes reaction-rise {
+  0% {
+    transform: translateY(0) scale(0.6);
+    opacity: 0;
+  }
+  12% {
+    transform: translateY(-10%) scale(1.1);
+    opacity: 1;
+  }
+  80% {
+    opacity: 1;
+  }
+  100% {
+    transform: translateY(-320%) scale(1);
+    opacity: 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .reaction-fly {
+    animation-duration: 1.4s;
+  }
+}
+
+.reaction-menu {
+  position: absolute;
+  bottom: calc(100% + 10px);
+  left: 50%;
+  transform: translateX(-50%);
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 2px;
+  padding: 6px;
+  border-radius: var(--r2);
+  border: 1px solid var(--border-emphasis);
+  background: var(--bg-elevated);
+  box-shadow: var(--shadow-2);
+  z-index: 20;
+}
+.reaction-btn {
+  width: 40px;
+  height: 40px;
+  display: grid;
+  place-items: center;
+  font-size: 22px;
+  border-radius: var(--r1);
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  transition: background var(--dur-1) var(--ease), transform var(--dur-1) var(--ease);
+}
+.reaction-btn:hover {
+  background: var(--bg-hover);
+  transform: scale(1.12);
+}
+
+/* ---------- muted-but-talking hint ---------- */
+.muted-hint {
+  position: absolute;
+  left: 50%;
+  bottom: 16px;
+  transform: translateX(-50%);
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  border-radius: var(--r-pill);
+  border: 1px solid color-mix(in srgb, var(--danger) 34%, transparent);
+  background: color-mix(in srgb, var(--danger) 16%, var(--bg-elevated));
+  color: var(--text-primary);
+  font-size: 13px;
+  box-shadow: var(--shadow-2);
+  z-index: 6;
+  animation: muted-hint-in var(--dur-2) var(--ease);
+}
+.muted-hint kbd {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  border: 1px solid var(--border-emphasis);
+  background: var(--bg-base);
+}
+@keyframes muted-hint-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, 8px);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, 0);
+  }
+}
+
+/* ---------- keyboard shortcuts help ---------- */
+.shortcuts-scrim {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: rgba(0, 0, 0, 0.5);
+  z-index: 50;
+  padding: var(--s4);
+}
+.shortcuts-card {
+  width: min(420px, 100%);
+  border-radius: var(--r2);
+  border: 1px solid var(--border-emphasis);
+  background: var(--bg-surface);
+  box-shadow: var(--shadow-2);
+  overflow: hidden;
+}
+.shortcut-list {
+  list-style: none;
+  margin: 0;
+  padding: var(--s3) var(--s4) var(--s4);
+}
+.shortcut-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--border-default);
+}
+.shortcut-list li:last-child {
+  border-bottom: none;
+}
+.shortcut-label {
+  color: var(--text-secondary);
+  font-size: 13.5px;
+}
+.shortcut-list kbd {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  padding: 2px 8px;
+  border-radius: var(--r1);
+  border: 1px solid var(--border-emphasis);
+  background: var(--bg-base);
+  color: var(--text-primary);
+}
