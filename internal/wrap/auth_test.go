@@ -66,6 +66,32 @@ func TestValidator_ValidTokenPasses(t *testing.T) {
 	}
 }
 
+// TestValidator_OverTTLTokenRejected exercises the MAX-TTL clamp: a token whose
+// remaining lifetime exceeds the configured ceiling is rejected even though its
+// signature/exp/tenant are all otherwise valid.
+func TestValidator_OverTTLTokenRejected(t *testing.T) {
+	t.Setenv(MaxTokenTTLEnv, "1h")
+	v := newValidatorForTest(t)
+
+	// Well under the ceiling → accepted.
+	if _, err := v.Validate(mintToken(t, "acme", "standup", 30*time.Minute)); err != nil {
+		t.Fatalf("30m token should pass under a 1h ceiling: %v", err)
+	}
+	// Far over the ceiling → rejected with the typed sentinel.
+	_, err := v.Validate(mintToken(t, "acme", "standup", 24*time.Hour))
+	if !errors.Is(err, ErrTokenTTLTooLong) {
+		t.Fatalf("24h token: got err=%v, want ErrTokenTTLTooLong", err)
+	}
+}
+
+func TestValidator_DefaultMaxTTLAllowsNormalTokens(t *testing.T) {
+	// No env override → DefaultMaxTokenTTL (6h). A 1h token is well within it.
+	v := newValidatorForTest(t)
+	if _, err := v.Validate(mintToken(t, "acme", "standup", time.Hour)); err != nil {
+		t.Fatalf("1h token under default ceiling should pass: %v", err)
+	}
+}
+
 func TestValidator_ExpiredTokenRejected(t *testing.T) {
 	v := newValidatorForTest(t)
 	// Mint a token that expired WELL outside the go-jose default 1-minute

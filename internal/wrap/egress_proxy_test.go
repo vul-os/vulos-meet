@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/livekit/protocol/auth"
+	"github.com/livekit/protocol/livekit"
+	"google.golang.org/protobuf/encoding/protojson"
 )
 
 // fakeLiveKitTwirp stands in for livekit-server's /twirp/livekit.Egress/*
@@ -19,14 +21,21 @@ import (
 // it sees so tests can assert that (a) valid recording-tokened requests
 // reach it, (b) bad-tenant / no-RoomRecord requests do not.
 type fakeLiveKitTwirp struct {
-	hits       []string
-	lastBody   []byte
-	lastAuth   string
-	lastHeader http.Header
-	respBody   string
-	respCT     string
-	respCode   int
-	respDelay  time.Duration
+	hits           []string
+	listEgressHits []string // ListEgress calls (incl. the proxy's ownership probe)
+	lastBody       []byte
+	lastAuth       string
+	lastHeader     http.Header
+	respBody       string
+	respCT         string
+	respCode       int
+	respDelay      time.Duration
+	// ownerRoom is the fully-qualified room the fake reports as the owner of any
+	// egress id queried via ListEgress(egress_id) — this is what the proxy's
+	// StopEgress/UpdateLayout/UpdateStream ownership probe reads. Defaults to
+	// "acme:standup" (same-tenant). Set it to a foreign room to simulate an
+	// egress owned by another tenant.
+	ownerRoom string
 }
 
 func newFakeLiveKitTwirp(t *testing.T, f *fakeLiveKitTwirp) *httptest.Server {
@@ -40,11 +49,32 @@ func newFakeLiveKitTwirp(t *testing.T, f *fakeLiveKitTwirp) *httptest.Server {
 	if f.respBody == "" {
 		f.respBody = `{"egress_id":"EG_test","status":1,"room_name":"acme:standup"}`
 	}
+	if f.ownerRoom == "" {
+		f.ownerRoom = "acme:standup"
+	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		// The proxy resolves an egress id's owning room via ListEgress(egress_id)
+		// before it forwards StopEgress/UpdateLayout/UpdateStream. Answer that
+		// probe from ownerRoom, echoing back the requested id.
+		if strings.HasSuffix(r.URL.Path, "/ListEgress") {
+			f.listEgressHits = append(f.listEgressHits, r.URL.Path)
+			var lr livekit.ListEgressRequest
+			_ = protojson.Unmarshal(body, &lr)
+			resp := &livekit.ListEgressResponse{Items: []*livekit.EgressInfo{{
+				EgressId: lr.GetEgressId(),
+				RoomName: f.ownerRoom,
+			}}}
+			out, _ := protojson.Marshal(resp)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(out)
+			return
+		}
 		f.hits = append(f.hits, r.URL.Path)
 		f.lastAuth = r.Header.Get("Authorization")
 		f.lastHeader = r.Header.Clone()
-		f.lastBody, _ = io.ReadAll(r.Body)
+		f.lastBody = body
 		if f.respDelay > 0 {
 			time.Sleep(f.respDelay)
 		}
@@ -362,7 +392,7 @@ func TestEgressProxy_UpstreamUnreachable_502(t *testing.T) {
 	defer gate.Close()
 
 	tok := mintEgressToken(t, "acme", "standup", time.Hour)
-	req, _ := http.NewRequest(http.MethodPost, gate.URL+"/twirp/livekit.Egress/StartRoomCompositeEgress", strings.NewReader(`{}`))
+	req, _ := http.NewRequest(http.MethodPost, gate.URL+"/twirp/livekit.Egress/StartRoomCompositeEgress", strings.NewReader(`{"room_name":"acme:standup"}`))
 	req.Header.Set("Authorization", "Bearer "+tok)
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
@@ -408,7 +438,7 @@ func TestEgressProxy_QueryStringPreserved(t *testing.T) {
 	defer gate2.Close()
 
 	tok := mintEgressToken(t, "acme", "standup", time.Hour)
-	req, _ := http.NewRequest(http.MethodPost, gate2.URL+"/twirp/livekit.Egress/StartRoomCompositeEgress?trace_id=abc", strings.NewReader(`{}`))
+	req, _ := http.NewRequest(http.MethodPost, gate2.URL+"/twirp/livekit.Egress/StartRoomCompositeEgress?trace_id=abc", strings.NewReader(`{"room_name":"acme:standup"}`))
 	req.Header.Set("Authorization", "Bearer "+tok)
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
@@ -428,6 +458,178 @@ func TestEgressProxy_RequiresInputs(t *testing.T) {
 	}
 	if _, err := NewEgressProxy(v, ""); err == nil {
 		t.Fatalf("expected error with empty upstream")
+	}
+}
+
+// egressGate spins up the fake livekit-server + the egress proxy behind the
+// signal gate and returns the gate URL plus the fake (for hit assertions).
+func egressGate(t *testing.T, f *fakeLiveKitTwirp) (string, *fakeLiveKitTwirp) {
+	t.Helper()
+	upstream := newFakeLiveKitTwirp(t, f)
+	t.Cleanup(upstream.Close)
+	addr := strings.TrimPrefix(upstream.URL, "http://")
+	g, _ := newGateForTest(t, addr)
+	p, _ := newEgressProxyForTest(t, addr)
+	gate := httptest.NewServer(g.Handler(nil, p))
+	t.Cleanup(gate.Close)
+	return gate.URL, f
+}
+
+func doEgress(t *testing.T, gateURL, method, tok, body string) *http.Response {
+	t.Helper()
+	req, _ := http.NewRequest(http.MethodPost, gateURL+"/twirp/livekit.Egress/"+method, strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do %s: %v", method, err)
+	}
+	return resp
+}
+
+// TestEgressProxy_CrossTenantBodyRoomRejected_403 is the core regression for the
+// HIGH cross-tenant BAC bug: a VALID RoomRecord token for tenant "acme" whose
+// Twirp body names ANOTHER tenant's room ("victim:secret"). The token check
+// passes (it's a legitimate acme recording token) but the body-room guard MUST
+// reject it before anything reaches livekit-server.
+func TestEgressProxy_CrossTenantBodyRoomRejected_403(t *testing.T) {
+	gateURL, f := egressGate(t, &fakeLiveKitTwirp{})
+	tok := mintEgressToken(t, "acme", "standup", time.Hour)
+
+	resp := doEgress(t, gateURL, "StartRoomCompositeEgress", tok, `{"room_name":"victim:secret"}`)
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status: %d body=%q (want 403)", resp.StatusCode, body)
+	}
+	if strings.Contains(string(body), "victim") || strings.Contains(string(body), tok) {
+		t.Fatalf("rejection body leaked contents: %q", body)
+	}
+	if len(f.hits) != 0 {
+		t.Fatalf("cross-tenant body must NOT reach upstream: %v", f.hits)
+	}
+}
+
+// TestEgressProxy_SameTenantBodyRoomForwarded confirms the legitimate path still
+// works: token room == body room ⇒ forwarded verbatim to livekit-server.
+func TestEgressProxy_SameTenantBodyRoomForwarded(t *testing.T) {
+	gateURL, f := egressGate(t, &fakeLiveKitTwirp{})
+	tok := mintEgressToken(t, "acme", "standup", time.Hour)
+
+	resp := doEgress(t, gateURL, "StartRoomCompositeEgress", tok, `{"room_name":"acme:standup"}`)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: %d (want 200)", resp.StatusCode)
+	}
+	if len(f.hits) != 1 || f.hits[0] != "/twirp/livekit.Egress/StartRoomCompositeEgress" {
+		t.Fatalf("same-tenant egress should have forwarded: %v", f.hits)
+	}
+}
+
+// TestEgressProxy_SameTenantWrongRoomRejected_403 shows the binding is to the
+// token's FULL room, not just its tenant: an acme token cannot start egress on
+// a DIFFERENT acme room it wasn't minted for.
+func TestEgressProxy_SameTenantWrongRoomRejected_403(t *testing.T) {
+	gateURL, f := egressGate(t, &fakeLiveKitTwirp{})
+	tok := mintEgressToken(t, "acme", "standup", time.Hour)
+
+	resp := doEgress(t, gateURL, "StartRoomCompositeEgress", tok, `{"room_name":"acme:other-room"}`)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status: %d (want 403)", resp.StatusCode)
+	}
+	if len(f.hits) != 0 {
+		t.Fatalf("wrong-room egress must NOT reach upstream: %v", f.hits)
+	}
+}
+
+// TestEgressProxy_ListEgressCrossTenantRejected_403 blocks the enumeration
+// vector: an acme token cannot ListEgress another tenant's room, nor run an
+// unscoped (no room filter) list that would enumerate every tenant on the box.
+func TestEgressProxy_ListEgressCrossTenantRejected_403(t *testing.T) {
+	gateURL, f := egressGate(t, &fakeLiveKitTwirp{})
+	tok := mintEgressToken(t, "acme", "standup", time.Hour)
+
+	// Foreign room filter → rejected.
+	resp := doEgress(t, gateURL, "ListEgress", tok, `{"room_name":"victim:secret"}`)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("foreign ListEgress status: %d (want 403)", resp.StatusCode)
+	}
+	// No room filter (global enumeration) → rejected.
+	resp = doEgress(t, gateURL, "ListEgress", tok, `{}`)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("unscoped ListEgress status: %d (want 403)", resp.StatusCode)
+	}
+	if len(f.listEgressHits) != 0 || len(f.hits) != 0 {
+		t.Fatalf("rejected ListEgress must NOT reach upstream: hits=%v list=%v", f.hits, f.listEgressHits)
+	}
+
+	// Same-tenant, scoped filter → forwarded to the upstream ListEgress surface.
+	resp = doEgress(t, gateURL, "ListEgress", tok, `{"room_name":"acme:standup"}`)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("same-tenant ListEgress status: %d (want 200)", resp.StatusCode)
+	}
+	if len(f.listEgressHits) != 1 {
+		t.Fatalf("same-tenant ListEgress should have forwarded once: %v", f.listEgressHits)
+	}
+}
+
+// TestEgressProxy_StopEgressCrossTenantRejected_403 blocks the StopEgress DoS
+// vector. StopEgress carries only an opaque egress id, so the proxy resolves the
+// owning room via an upstream ListEgress probe: when that room belongs to
+// another tenant ("victim:secret") the stop MUST be rejected and never
+// forwarded.
+func TestEgressProxy_StopEgressCrossTenantRejected_403(t *testing.T) {
+	gateURL, f := egressGate(t, &fakeLiveKitTwirp{ownerRoom: "victim:secret"})
+	tok := mintEgressToken(t, "acme", "standup", time.Hour)
+
+	resp := doEgress(t, gateURL, "StopEgress", tok, `{"egress_id":"EG_victim"}`)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status: %d (want 403)", resp.StatusCode)
+	}
+	if len(f.hits) != 0 {
+		t.Fatalf("cross-tenant StopEgress must NOT be forwarded: %v", f.hits)
+	}
+	if len(f.listEgressHits) == 0 {
+		t.Fatalf("proxy should have run an ownership probe")
+	}
+}
+
+// TestEgressProxy_UpdateLayoutCrossTenantRejected_403 mirrors the StopEgress
+// case for the other egress-id-keyed method the cloud uses.
+func TestEgressProxy_UpdateLayoutCrossTenantRejected_403(t *testing.T) {
+	gateURL, f := egressGate(t, &fakeLiveKitTwirp{ownerRoom: "victim:secret"})
+	tok := mintEgressToken(t, "acme", "standup", time.Hour)
+
+	resp := doEgress(t, gateURL, "UpdateLayout", tok, `{"egress_id":"EG_victim","layout":"grid"}`)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status: %d (want 403)", resp.StatusCode)
+	}
+	if len(f.hits) != 0 {
+		t.Fatalf("cross-tenant UpdateLayout must NOT be forwarded: %v", f.hits)
+	}
+}
+
+// TestEgressProxy_OverTTLTokenRejected exercises the MAX-TTL clamp end to end:
+// a token whose remaining lifetime exceeds the ceiling is refused (mapped to
+// 401 on the egress path) and never reaches livekit-server.
+func TestEgressProxy_OverTTLTokenRejected(t *testing.T) {
+	t.Setenv(MaxTokenTTLEnv, "1h")
+	gateURL, f := egressGate(t, &fakeLiveKitTwirp{})
+	tok := mintEgressToken(t, "acme", "standup", 24*time.Hour) // 24h ≫ 1h ceiling
+
+	resp := doEgress(t, gateURL, "StartRoomCompositeEgress", tok, `{"room_name":"acme:standup"}`)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status: %d (want 401)", resp.StatusCode)
+	}
+	if len(f.hits) != 0 {
+		t.Fatalf("over-TTL token must NOT reach upstream: %v", f.hits)
 	}
 }
 

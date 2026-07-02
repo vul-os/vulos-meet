@@ -6,6 +6,9 @@ package wrap
 import (
 	"errors"
 	"fmt"
+	"os"
+	"strings"
+	"time"
 
 	"github.com/livekit/protocol/auth"
 )
@@ -13,6 +16,19 @@ import (
 // SubprotocolVersion is the Vulos sub-protocol identifier carried by every
 // token vulos-meet accepts. Versioning rules: see spec/VERSIONS.md.
 const SubprotocolVersion = "VULOS-MEET/1"
+
+// MaxTokenTTLEnv configures the ceiling on a token's remaining lifetime
+// (exp - now). vulos-meet does not mint tokens — the cloud CP does — so this
+// is the SFU side's only independent bound on how long a single CP-minted
+// token stays usable. A token whose remaining lifetime exceeds this ceiling is
+// rejected, so an accidentally (or maliciously) over-long token can't be
+// replayed indefinitely. Empty/invalid ⇒ DefaultMaxTokenTTL.
+const MaxTokenTTLEnv = "MEET_MAX_TOKEN_TTL"
+
+// DefaultMaxTokenTTL is the default ceiling on a token's remaining lifetime.
+// A few hours comfortably covers a long meeting plus a recording that outlives
+// it, while bounding the blast radius of a leaked token.
+const DefaultMaxTokenTTL = 6 * time.Hour
 
 // Token-validation errors. Callers (HTTP gate, signaling reverse proxy) MUST
 // map these to 401/403 with no token contents in the response body.
@@ -25,6 +41,7 @@ var (
 	ErrTokenWrongTenant   = errors.New("vulos-meet: token tenant does not match token room prefix")
 	ErrTokenMissingTenant = errors.New("vulos-meet: token has no tenant audience")
 	ErrTokenRoomMalformed = errors.New("vulos-meet: token room id is malformed")
+	ErrTokenTTLTooLong    = errors.New("vulos-meet: token remaining lifetime exceeds the configured ceiling")
 )
 
 // Validator validates VULOS-MEET/1 tokens.
@@ -44,10 +61,11 @@ var (
 //     binding. A token for tenant A cannot be replayed against a room owned
 //     by tenant B because the prefix wouldn't match the audience.
 type Validator struct {
-	apiKey    string
-	apiSecret string
-	tenant    *Tenant
-	metrics   *Metrics // optional — nil disables outcome observation
+	apiKey      string
+	apiSecret   string
+	tenant      *Tenant
+	maxTokenTTL time.Duration // ceiling on exp-now; 0 disables the clamp
+	metrics     *Metrics      // optional — nil disables outcome observation
 }
 
 // NewValidator builds a validator bound to the shared LiveKit API key/secret
@@ -62,7 +80,13 @@ func NewValidator(apiKey, apiSecret string, tenant *Tenant) (*Validator, error) 
 	if tenant == nil {
 		return nil, errors.New("vulos-meet: validator requires a tenant gate")
 	}
-	return &Validator{apiKey: apiKey, apiSecret: apiSecret, tenant: tenant}, nil
+	maxTTL := DefaultMaxTokenTTL
+	if raw := strings.TrimSpace(os.Getenv(MaxTokenTTLEnv)); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil && d > 0 {
+			maxTTL = d
+		}
+	}
+	return &Validator{apiKey: apiKey, apiSecret: apiSecret, tenant: tenant, maxTokenTTL: maxTTL}, nil
 }
 
 // SetMetrics attaches a metrics registry. Calling with nil clears the
@@ -99,9 +123,19 @@ func (v *Validator) Validate(raw string) (vt *ValidatedToken, err error) {
 		return nil, ErrTokenWrongAPIKey
 	}
 	// Verify also checks `iss == apiKey`, `exp`, and `nbf` (Time = now).
-	_, grants, err := parsed.Verify(v.apiSecret)
+	claims, grants, err := parsed.Verify(v.apiSecret)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrTokenSignatureBad, err)
+	}
+	// MAX-TTL clamp (defense-in-depth): Verify has already rejected an expired
+	// token, but it does NOT bound how far in the future `exp` may sit. A CP-
+	// minted token with an over-long lifetime would otherwise be replayable for
+	// as long as it lives. Reject any token whose remaining lifetime exceeds the
+	// configured ceiling. A token with no `exp` is left to Verify's own policy.
+	if v.maxTokenTTL > 0 && claims != nil && claims.Expiry != nil {
+		if time.Until(claims.Expiry.Time()) > v.maxTokenTTL {
+			return nil, ErrTokenTTLTooLong
+		}
 	}
 	if grants == nil || grants.Video == nil {
 		return nil, ErrTokenMissingGrants

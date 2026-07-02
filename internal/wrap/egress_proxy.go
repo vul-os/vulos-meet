@@ -189,7 +189,7 @@ func (p *EgressProxy) serve(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	p.forward(w, r, seam, ok)
+	p.forward(w, r, vt, seam, ok)
 }
 
 // forward reads the inbound body into memory and POSTs it verbatim to the
@@ -198,7 +198,7 @@ func (p *EgressProxy) serve(w http.ResponseWriter, r *http.Request) {
 // here would either add a Twirp dep to vulos-meet OR risk content-type
 // drift breaking the proxy. The body is small (Twirp egress requests are
 // kilobytes at most), so the buffer cost is bounded.
-func (p *EgressProxy) forward(w http.ResponseWriter, r *http.Request, seam StorageSeam, seamPresent bool) {
+func (p *EgressProxy) forward(w http.ResponseWriter, r *http.Request, vt *ValidatedToken, seam StorageSeam, seamPresent bool) {
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20)) // 1 MiB cap; Twirp egress payloads are kilobytes
 	if err != nil {
 		p.metrics.ObserveEgress(EgressOutcomeRejected)
@@ -207,6 +207,20 @@ func (p *EgressProxy) forward(w http.ResponseWriter, r *http.Request, seam Stora
 	}
 	_ = r.Body.Close()
 
+	method := strings.TrimPrefix(r.URL.Path, EgressTwirpPathPrefix)
+
+	// CROSS-TENANT BODY GUARD (fail closed). The token check upstream only
+	// proved the caller holds a valid RoomRecord token for their OWN tenant; it
+	// did NOT look at the Twirp body, whose room_name / egress_id is attacker-
+	// controlled. Bind the body's target room/egress to the token's tenant here,
+	// BEFORE any upstream forward and before the storage-seam rewrite, so a
+	// cross-tenant egress never touches livekit-server. See authorizeEgressTenant.
+	if !p.authorizeEgressTenant(r.Context(), method, r.Header.Get("Content-Type"), body, vt, r.Header.Get("Authorization")) {
+		p.metrics.ObserveEgress(EgressOutcomeForbidden)
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
 	// When the gateway-injected storage seam is present, rewrite Start*Egress
 	// bodies so recording/egress artifacts land in the shared per-user bucket.
 	// A decode/encode failure FAILS the request (400) rather than silently
@@ -214,7 +228,6 @@ func (p *EgressProxy) forward(w http.ResponseWriter, r *http.Request, seam Stora
 	// the unintended place is worse than refusing the egress. Methods with no
 	// storage output (Stop/List/Update, stream-only Starts) pass through.
 	if seamPresent {
-		method := strings.TrimPrefix(r.URL.Path, EgressTwirpPathPrefix)
 		rewritten, changed, rerr := rewriteEgressBodyForSeam(method, r.Header.Get("Content-Type"), body, seam)
 		if rerr != nil {
 			p.metrics.ObserveEgress(EgressOutcomeRejected)
